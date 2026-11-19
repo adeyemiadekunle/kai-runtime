@@ -13,7 +13,10 @@ const sourceBackend = process.argv[2] || "native";
 const targetBackend = process.argv[3] || "wasm";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
-const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
+const wasm = sourceBackend === "wasm" || targetBackend === "wasm"
+  ? await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"))
+  : undefined;
+const caseFilter = process.argv[4];
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 
 const textOf = (message) => typeof message.content === "string"
@@ -1312,12 +1315,11 @@ test("a v1 journal from the first journaled libfx still resumes", async () => {
   await plain.close();
 });
 
-// No published libfx wrote journals before this one; the sessions the
-// previous release saved are checkpoints. This one was taken by published
-// libfx 0.0.11 after a plain turn and a tool turn.
+// The oldest released-state fixture predates journals. Published libfx
+// 0.0.11 saved this checkpoint after a plain turn and a tool turn.
 const previousCheckpoint = JSON.parse(await readFile(resolve(scriptDir, "fixtures/libfx-0.0.11-checkpoint.json"), "utf8"));
 
-test("a checkpoint saved by the previous published libfx restores in this one", async () => {
+test("a checkpoint saved by published libfx 0.0.11 restores in this one", async () => {
   assert.equal(previousCheckpoint.libfx, "0.0.11");
   const checkpoint = new Uint8Array(Buffer.from(previousCheckpoint.checkpoint, "base64"));
   const agent = await createFxEngine(options(targetBackend, undefined, { checkpoint }));
@@ -1328,6 +1330,63 @@ test("a checkpoint saved by the previous published libfx restores in this one", 
   for (const text of ["remember plums", "use the tool", "what did I say"]) assert.ok(users.includes(text), `${text} is in the history`);
   assert.ok(JSON.stringify(toolResults(requests[0])).includes("value of alpha is beta"), "the tool result survived");
 });
+
+// Recorded with each published SDK and its matching native addon against a
+// synthetic provider. Keep the original bytes: reserializing with this SDK
+// would stop checking the reader against the released writer.
+for (const version of ["0.0.16", "0.0.17"]) {
+  const saved = JSON.parse(await readFile(resolve(scriptDir, `fixtures/libfx-${version}-journal.json`), "utf8"));
+  assert.equal(saved.libfx, version);
+  assert.equal(saved.model, "journal/model");
+
+  test(`released ${version} journal restores without repeating a completed tool`, async () => {
+    const store = createMemoryPersistence();
+    store.records.push(...saved.records.map(record => ({
+      ...record,
+      data: new Uint8Array(Buffer.from(record.data, "base64")),
+    })));
+    let toolCalls = 0;
+    const agent = await createFxEngine(options(targetBackend, undefined, {
+      sessionId: saved.sessionId,
+      persistence: store,
+      tools: [{ ...lookup, execute: async () => { toolCalls += 1; return "unexpected replay"; } }],
+    }));
+    try {
+      requests.length = 0;
+      const repeated = agent.prompt("use the tool", { turnId: "released-tool" });
+      for await (const ignored of repeated) {}
+      assert.equal((await repeated.result).stopReason, "end_turn");
+      assert.equal(requests.length, 0, "a settled retry must not contact the model");
+      assert.equal(toolCalls, 0, "a settled retry must not repeat a tool");
+      await run(agent, "what did I say");
+      assert.equal(requests.length, 1);
+      const users = userTexts(requests[0]);
+      assert.ok(users.includes("remember plums"));
+      assert.ok(users.includes("use the tool"));
+      assert.ok(JSON.stringify(toolResults(requests[0])).includes("value of alpha is beta"));
+      assert.equal(toolCalls, 0);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  test(`released ${version} checkpoint restores its conversation and tool result`, async () => {
+    const agent = await createFxEngine(options(targetBackend, undefined, {
+      checkpoint: new Uint8Array(Buffer.from(saved.checkpoint, "base64")),
+    }));
+    try {
+      requests.length = 0;
+      await run(agent, "what did I say");
+      assert.equal(requests.length, 1);
+      const users = userTexts(requests[0]);
+      assert.ok(users.includes("remember plums"));
+      assert.ok(users.includes("use the tool"));
+      assert.ok(JSON.stringify(toolResults(requests[0])).includes("value of alpha is beta"));
+    } finally {
+      await agent.close();
+    }
+  });
+}
 
 test("each progress event names the model its request goes to", async () => {
   const journal = eventJournal();
@@ -2246,7 +2305,9 @@ test("a yielded turn resumed in place after its checkpoint reopens from any cut"
   }
 });
 try {
-  for (const { name, body } of cases) {
+  const selectedCases = caseFilter ? cases.filter(({ name }) => name.includes(caseFilter)) : cases;
+  assert.ok(selectedCases.length > 0, "the journal case filter must select at least one test");
+  for (const { name, body } of selectedCases) {
     await body();
     console.log(`ok - ${name}`);
   }
