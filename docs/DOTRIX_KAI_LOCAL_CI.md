@@ -26,10 +26,12 @@ Toolchain: Zig 0.17.0 (the workflows' pin), Bun 1.4.4 and Node 22.23.5 (the work
 | SDK (Node + N-API) | `test:node-napi`, minimal native integrations, durable sessions on N-API | Passed |
 | SDK (Bun) | N-API lane, durable and core suites, journal, tool contract, host tools, cancellation, MCP and skills adapters (native) | Passed |
 | Shellcheck | `bash -n` and `shellcheck` on the listed scripts | Passed |
-| E2E | The whole deterministic corpus through `ci-run-files.sh`, in two local shards | Running when this was recorded; so far `tui-resize` and one other file passed only on retry (reported as warnings, as CI does), and `tui-terminal-tool` failed on process-group stops (see below) |
-| TLA+ MCP, transcript window, subagent | As in the workflow | Not yet run; queued after E2E |
+| E2E | The whole deterministic corpus through `ci-run-files.sh`, in two local shards | 82 files: 73 passed, 4 passed only on retry (`mcp-http`, `mcp-verbs`, `tui-composer-edit-contracts`, `tui-resize`, which CI reports as warnings), 5 failed; see below |
+| TLA+ MCP, transcript window, subagent | As in the workflow | Running in the `ac077e2f` pass below |
 
 The four unit-test failures are `core.cli.doctor_probes` (a child killed with its group at the deadline), `core.execution.command_runner` (a timeout terminates the foreground process group's descendants), and two `mcp.io.process` tests (stopping or deinitializing a server signals its whole process group). All four signal a process group. They failed the same way, as root, on the earlier commit `5cb37e3a`, which has neither this change nor any change to those modules. They fail in this container because its PID 1 (`process_api`) doesn't reap orphaned processes: a process a group stop killed stays a zombie that still answers `kill(pid, 0)`, so the test sees it running. A direct check showed an orphaned, killed grandchild left in state `Z`, and gone when run under `tini -s`, which reaps like a normal init. Hosted runners reap orphans. The E2E terminal-tool failures have the same cause. Re-running these tests under `tini -s` is pending.
+
+Of the 5 E2E files that failed after their retry, `tui-terminal-tool` passed (19 of 19) when rerun under `tini -s` with Bun 1.4.2, the workflow's pin: its failures were the zombie processes above. The other four (`gateway-stream-lifecycle`, 1 test; `review-model-override`, 1 test, `ERR_BODY_ALREADY_USED` in the test's fake server; `tui-command-permissions`, 1 test; `tui-decision-prompts`, the Herdr cases, `write EPIPE`) failed the same way under those conditions, and identically with the published fx 0.0.17 release binary (checksum verified) in place of this build. They don't come from this branch; hosted CI must confirm whether they fail there too.
 
 Not run locally: macOS arm64 and every macOS job, Linux arm64, the SDK package guards (they need the addon for all four platforms), the WASM and browser lanes that need JSPI or Chrome (`sdk-node-wasm`, `sdk-browser-wasm`), live model and live network E2E, and the binary-size, benchmark, and nightly fuzz workflows.
 
@@ -48,3 +50,15 @@ Run from the working checkout with local Postgres 16 and pgvector, and Node 22 (
 | fx Chat suites on the Kai runtime build (`d9a877c`) | 158 passed, 2 skipped (paid live-model tests); the same on the 0.0.16 host |
 
 Not run locally: the Windows desktop build and the release workflows.
+
+## kai-runtime `ac077e2f` (`max_subagents`) and `3a997576` (changelog)
+
+Pushed while this pass was running, at the session's request. Run as before, plus a reaping init (`tini -s`) for the unit suite and Bun 1.4.2. `3a997576` changes only `CHANGELOG.md` and `AGENTS.md`.
+
+| Step | Result |
+| --- | --- |
+| Format, CLI shape, PGSO corpus, public surface, boundaries | Passed |
+| Unit tests, build, smoke, TLA+ subagent, MCP and transcript window, E2E for ACP, project config, config persistence, MCP verbs, CLI, doctor, toolbox, sessions, TUI agents, session recovery | Running when pushed; results follow in the next update |
+
+The new `max_subagents` unit test and the settings-list tests passed in a run as root at `ac077e2f` before this pass.
+
