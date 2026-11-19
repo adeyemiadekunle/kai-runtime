@@ -3,7 +3,8 @@ name: Kai release
 # Tags a published Kai runtime version and creates its GitHub release, from docs/releases/v<version>.md
 # on main. Started by hand once the version's packages are on GitHub Packages
 # (publish-private-libfx.yml or scripts/package-private-libfx.sh). The tag is v<version>, on the commit
-# the packages were built from; an existing tag or release is never moved or replaced.
+# the packages were built from (a lightweight tag the release creates); an existing tag or release is never
+# moved or replaced.
 
 on:
   workflow_dispatch:
@@ -51,8 +52,7 @@ jobs:
           COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${VERSION}" "$COMMIT" -m "Kai runtime ${VERSION}"
-          git push origin "refs/tags/v${VERSION}"
-          gh release create "v${VERSION}" --verify-tag --title "Kai runtime ${VERSION}" --notes-file "docs/releases/v${VERSION}.md"
+          # The release creates the tag on the commit itself. A `git push` of the tag is refused: the commit's
+          # workflow files differ from main's, and this token may not create a ref that changes workflows.
+          gh release create "v${VERSION}" --target "$COMMIT" --title "Kai runtime ${VERSION}" --notes-file "docs/releases/v${VERSION}.md"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/v${VERSION}" --jq .sha)" = "$COMMIT"
