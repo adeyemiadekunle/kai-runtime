@@ -19,7 +19,8 @@ concurrency:
 
 jobs:
   check-version:
-    if: github.ref == 'refs/heads/main'
+    # Upstream's publishing: the Kai runtime fork publishes through publish-private-libfx.yml instead.
+    if: github.repository == 'vercel-labs/fx' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       needed: ${{ steps.check.outputs.needed }}

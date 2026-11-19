@@ -15,7 +15,9 @@ concurrency:
 
 jobs:
   build:
+    # Upstream's publishing: the Kai runtime fork publishes through publish-private-libfx.yml instead.
     if: >-
+      github.repository == 'vercel-labs/fx' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository
@@ -63,7 +65,9 @@ jobs:
             fx-${{ matrix.name }}.tar.gz.sha256
 
   web:
+    # Upstream's publishing: the Kai runtime fork publishes through publish-private-libfx.yml instead.
     if: >-
+      github.repository == 'vercel-labs/fx' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository

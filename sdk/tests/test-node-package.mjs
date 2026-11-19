@@ -82,6 +82,30 @@ try {
     assert.ok(existsSync(join(packageDir, target)), `package is missing ${target}`);
   }
 
+  // A private build names every package in its scope and keeps the @libfx/
+  // names node.js loads as aliases, so nothing that imports libfx changes.
+  const scopedRoot = join(temp, "scoped");
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  run(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), scopedRoot], {
+    env: { LIBFX_VERSION: "1.2.3-kai.4", LIBFX_SCOPE: "@owner", LIBFX_NAME: "kai", LIBFX_REGISTRY: "https://npm.pkg.github.com", LIBFX_SOURCE_COMMIT: commit },
+  });
+  const scoped = JSON.parse(await readFile(join(scopedRoot, "libfx", "package.json"), "utf8"));
+  assert.equal(scoped.name, "@owner/kai");
+  assert.equal(scoped.gitHead, commit);
+  assert.equal(scoped.publishConfig.registry, "https://npm.pkg.github.com");
+  assert.deepEqual(scoped.optionalDependencies, Object.fromEntries(Object.values(nativePackages).map((name) =>
+    [name, `npm:${name.replace(/^@libfx\/libfx/, "@owner/kai")}@1.2.3-kai.4`])));
+  const scopedNative = JSON.parse(await readFile(join(scopedRoot, basename(localNativeDir), "package.json"), "utf8"));
+  assert.equal(scopedNative.name, localNativePackage.replace(/^@libfx\/libfx/, "@owner/kai"));
+  assert.equal(scopedNative.publishConfig.registry, "https://npm.pkg.github.com");
+  assert.equal(scopedNative.gitHead, commit);
+  for (const [variable, value] of [["LIBFX_SCOPE", "owner"], ["LIBFX_SOURCE_COMMIT", "main"], ["LIBFX_NAME", "kai"]]) {
+    const refused = spawnSync(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), join(temp, "refused")], {
+      encoding: "utf8", env: { ...process.env, [variable]: value },
+    });
+    assert.notEqual(refused.status, 0, `${variable}=${value} must be refused`);
+  }
+
   const archiveValidator = packageJob.match(/- name: Validate package archive\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
   assert.ok(archiveValidator, "publisher archive validation must exist");
   const reportPath = join(temp, "libfx-pack.json");
