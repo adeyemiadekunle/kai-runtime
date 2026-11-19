@@ -262,6 +262,7 @@ pub fn finishAssistantTerminalWithExecution(
         .assistant = @constCast(assistant_text),
         .provider_replay = replay,
         .execution = context_execution,
+        .output_limited = disposition == .length_limited,
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(

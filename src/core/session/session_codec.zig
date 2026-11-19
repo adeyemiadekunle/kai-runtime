@@ -614,6 +614,15 @@ pub fn turnUsesNotesSchema(turn: session.HistoryTurn) bool {
     };
 }
 
+/// Whether `turn` is an answer the provider stopped at its output limit, which
+/// a reader that predates `output_limited` would take for a completed one.
+pub fn turnIsOutputLimited(turn: session.HistoryTurn) bool {
+    return switch (turn) {
+        .assistant => |entry| entry.output_limited,
+        .interrupted, .compacted_summary => false,
+    };
+}
+
 pub fn turnNamesImages(turn: session.HistoryTurn, stored: ?*const StoredImages) bool {
     return switch (turn) {
         .assistant => |entry| namesImages(entry.user, stored) or executionNamesImages(entry.execution, .{}, stored),
@@ -792,6 +801,8 @@ fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_b
             try writeDurableBytes(writer, entry.assistant);
             try writer.writeAll(",\"provider_replay\":");
             try std.json.Stringify.value(entry.provider_replay, .{}, writer);
+            // Written only when set, so every other turn keeps its bytes.
+            if (entry.output_limited) try writer.writeAll(",\"output_limited\":true");
             try writer.writeAll(",\"execution\":");
             try writeExecutionMemoryJsonFrom(writer, entry.execution, .durable, .{}, image_blobs);
             try writer.writeByte('}');
@@ -929,8 +940,13 @@ pub fn parseHistoryTurnWithImages(
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
-        const shape = try exactVariantObject(value, &.{ "kind", "user", "assistant", "execution" }, &.{ "kind", "user", "assistant", "execution", "provider_replay" });
-        const object = shape.object;
+        // A turn cut off at the output limit has every extended key and
+        // `output_limited`; any other turn has the legacy or extended keys.
+        const marked = value == .object and value.object.get("output_limited") != null;
+        const object = if (marked)
+            try exactObject(value, &.{ "kind", "user", "assistant", "execution", "provider_replay", "output_limited" })
+        else
+            (try exactVariantObject(value, &.{ "kind", "user", "assistant", "execution" }, &.{ "kind", "user", "assistant", "execution", "provider_replay" })).object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, sources);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
@@ -938,11 +954,17 @@ pub fn parseHistoryTurnWithImages(
         const execution = try parseExecutionMemoryWith(alloc, object.get("execution") orelse return error.InvalidSessionFormat, sources);
         errdefer session.freeExecutionMemory(alloc, execution);
         const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
+        // Present only as true: a writer leaves it out otherwise.
+        const output_limited = if (object.get("output_limited")) |flag|
+            if (flag == .bool and flag.bool) true else return error.InvalidSessionFormat
+        else
+            false;
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
             .provider_replay = replay,
+            .output_limited = output_limited,
         } };
     }
     if (std.mem.eql(u8, kind, "background_command")) {

@@ -2076,6 +2076,8 @@ fn handleKernelJournalOpen(
     if (opened.last_turn_id.slice()) |id| {
         try response.writer.writeAll(",\"lastTurnId\":");
         try writeJsonStr(id, &response.writer);
+        // How that turn ended, when it was not a completed answer.
+        if (opened.last_turn_output_limited) try response.writer.writeAll(",\"lastTurnStopReason\":\"max_output_tokens\"");
     }
     // The calls the open turn left running, which the host may have the
     // resume run again instead of leaving them to the model.

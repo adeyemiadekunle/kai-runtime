@@ -1249,6 +1249,8 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
   // ended, so a retried prompt continues or skips its turn.
   let openTurnId = null;
   let lastTurnId = null;
+  // How the last turn ended when it was not a completed answer, for a retried prompt.
+  let lastTurnStopReason = null;
   // The calls the open turn left running: `{ id, name, arguments }`, and
   // what the resume tells the model about each one it does not run again.
   let ambiguousCalls = [];
@@ -1876,6 +1878,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       resumable = opened?.resumable === true;
       openTurnId = resumable && validTurnId(opened?.openTurnId) ? opened.openTurnId : null;
       lastTurnId = validTurnId(opened?.lastTurnId) ? opened.lastTurnId : null;
+      lastTurnStopReason = lastTurnId && opened?.lastTurnStopReason === "max_output_tokens" ? "max_output_tokens" : null;
       ambiguousCalls = resumable && Array.isArray(opened?.runningCalls)
         ? opened.runningCalls.filter((call) => typeof call?.id === "string" && typeof call.name === "string")
         : [];
@@ -1944,7 +1947,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           resumable = false;
           return resumeOpenTurn(promptOptions);
         }
-        if (turnId === lastTurnId) return endedTurn(turnId);
+        if (turnId === lastTurnId) return endedTurn(turnId, lastTurnStopReason ?? "end_turn");
       }
       // A new prompt ends a turn the last process left open as interrupted.
       resumable = false;
@@ -2150,11 +2153,12 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     };
   }
 
-  // A turn the journal shows already ended, returned for a retried prompt.
-  function endedTurn(id) {
+  // A turn the journal shows already ended, returned for a retried prompt,
+  // with how it ended: an answer stopped at the output limit stays one.
+  function endedTurn(id, stopReason) {
     return {
       id,
-      result: Promise.resolve({ stopReason: "end_turn", usage: {} }),
+      result: Promise.resolve({ stopReason, usage: {} }),
       cancel() {},
       steer() { return Promise.reject(new Error("no prompt is running")); },
       withdraw() { return Promise.resolve("already_placed"); },
@@ -2433,7 +2437,10 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           ambiguousCalls = [];
         } else if (!handedOff) {
           // A handed-off turn stays open for the next agent.
-          if (turn.id) lastTurnId = turn.id;
+          if (turn.id) {
+            lastTurnId = turn.id;
+            lastTurnStopReason = value.stopReason === "max_output_tokens" && !cancelled ? "max_output_tokens" : null;
+          }
           openTurnId = null;
         }
         return { stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage };

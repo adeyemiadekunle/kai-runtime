@@ -2636,6 +2636,10 @@ pub const AssistantHistoryTurn = struct {
     assistant: []u8,
     execution: ExecutionMemory = .{},
     provider_replay: ?ProviderReplay = null,
+    /// The provider stopped the answer at its output limit. The turn stays
+    /// in history as an assistant turn, so the next turn sees what it said,
+    /// but a host retrying it must not take it for a completed answer.
+    output_limited: bool = false,
 };
 
 /// What a turn write does with the recovery module's record for the model
@@ -3071,6 +3075,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .assistant = assistant,
                 .execution = execution,
                 .provider_replay = replay,
+                .output_limited = entry.output_limited,
             } };
         },
         .interrupted => |entry| blk: {

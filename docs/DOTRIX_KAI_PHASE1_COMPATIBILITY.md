@@ -2,7 +2,7 @@
 
 Recorded on 19 November 2026. This page records the Phase 1 evidence from the [migration plan](DOTRIX_KAI_MIGRATION_PLAN.md): whether the fork's SDK can replace Dotrix Chat's `libfx@0.0.16` pin, and what blocks it. It does not establish macOS, Windows, paid-model, or deployed behavior.
 
-**Result:** the fork reads every Dotrix journal shape tested here that 0.0.16 wrote, and a 0.0.16 host reads the fork's journals back. One gap blocks admitting the fork for new Chat work: libfx 0.0.17 journals an answer that the provider cut off at its output limit as an ordinary completed turn, so a retry of that turn returns the truncated text as a complete reply. Upstream fx main has the same behavior. The Dotrix pin stays at 0.0.16 until that is fixed. **R3.3, R3.5, R7.3, R7.6.**
+**Result:** the fork reads every Dotrix journal shape tested here that 0.0.16 wrote. The one blocking gap, G1, was that libfx 0.0.17 journals an answer the provider cut off at its output limit as an ordinary completed turn, so a retry returned the truncated text as complete. Upstream fx main has the same behavior. G1 is fixed in the fork (see the [gap list](#gap-list)); the Dotrix pin stays at 0.0.16 until the fix passes CI and the pin change lands. **R3.3, R3.5, R7.3, R7.6.**
 
 ## Revisions and artifacts
 
@@ -74,17 +74,30 @@ Those native tests first failed on this host for a reason unrelated to fx. Dotri
 
 | ID | Gap | Blocks | Owner |
 | --- | --- | --- | --- |
-| G1 | An output-limit cutoff is journaled as a completed turn. From 0.0.17, the runtime settles a `finish_reason: "length"` answer with `stopReason: "max_output_tokens"`; 0.0.16 failed the turn. Its `turn_committed` record is `kind: "assistant"` with no marker of the cutoff, unlike a content-filter cutoff (`kind: "interrupted"`, `terminal_reason: "failed"`). A retry of that turn ID reports `end_turn`, and Dotrix's host fills the text from the journal, so a Continue or recovered attempt would finish the run with a truncated reply. Every reader, including a 0.0.16 rollback, is affected for journals written by 0.0.17 or later. | Admitting the fork for new Chat work | Runtime: record the terminal stop reason on the committed turn and return it for a repeated turn. Needs a saved-format review, because a 0.0.16 rollback reader must still parse the record. Host fallback: Dotrix records non-`end_turn` outcomes per message, which leaves a crash window between the runtime's commit and the host's record. |
+| G1 | **Fixed in the fork, pending CI.** An output-limit cutoff was journaled as a completed turn. From 0.0.17, the runtime settles a `finish_reason: "length"` answer with `stopReason: "max_output_tokens"`; 0.0.16 failed the turn. Its `turn_committed` record was `kind: "assistant"` with no marker, so a retry of that turn ID reported `end_turn`. The fork now records `output_limited: true` on that turn, at journal event version 5 and checkpoint version 5, and a retried turn reports `max_output_tokens`. Readers up to version 4, including 0.0.16 and published 0.0.17, refuse such a session instead of misreading it. Journals already written by unfixed 0.0.17 never recorded the cutoff and cannot be repaired, so Dotrix lists only `0.0.16` as readable by the fork. Dotrix's `test_fx_replay_does_not_treat_a_truncated_or_refused_answer_as_complete[length]` expects the retry to raise; with the fork it returns `max_output_tokens`, which `fx_pilot` already rejects, so widen that assertion when the pin changes. | Admitting the fork for new Chat work until CI passes | Fork |
 | G2 | No private package scope, registry, or CI credential path. The fork artifact here is a local tarball. | Changing the Dotrix pin | Owner decision |
 | G3 | Only Linux x64 was built and tested. The packager needs every platform's addon for a publishable set; macOS arm64 CI has not run on this commit. | Publishing; any macOS claim | Fork CI |
 | G4 | Not yet covered across artifacts: a pending approval decided after a restart, a saved write result returned without repeating it, accepted steering before a crash, a delegation handoff, and the `createFxAgent` memory/local session path. They pass on a single artifact in the Dotrix suites above. | Admitting saved runs mid-approval or mid-delegation | Extend `test_fx_cross_version.py` |
 | G5 | Phase 2 provider capability checks (streaming, tools, errors, cancellation per provider and model) have not started. | Phase 3 | Phase 2 |
 
+## G1 fix verification
+
+Recorded on Linux x64 with Zig 0.17.0, on the commit that adds the fix.
+
+- `sdk/tests/test-journal.mjs native native`: 84 passed, including two new cases (a journal retry and a checkpoint restore of a cut-off turn both report `max_output_tokens` with no model request, and only the cut-off turn is written at version 5). The released 0.0.16 and 0.0.17 fixtures still restore.
+- New Zig tests in `journal.zig`: a cut-off turn writes and folds at event version 5 and checkpoint version 5, a completed turn keeps its version 1 bytes, and `output_limited` other than `true` is refused.
+- `test-native-core-ready`, `test-host-tools`, `test-host-tool-cancel`, and `test-native-core-misuse`: passed. `zig fmt --check src/`, the agents, compactor, indexer, and recovery boundary checks, and `check-public-surface.sh`: passed.
+- `zig build test`: 11,234 passed, 31 skipped, 7 failed, 4 crashed in the main suite; the session manager suites had 4 failures each. Every failure is a process-group signal, read-only file, or file-mode test. The container runs as root, and the session manager failures pass as an unprivileged user. None is in the journal, checkpoint, or session codec. They were not re-run against the unchanged baseline, so treat that as unconfirmed until CI runs.
+- Dotrix's real host with the fixed fork packed as `0.0.17-dotrix.2`: the cross-version harness passes 0.0.16 → fork, fork → fork, and, by refusing the session, fork → 0.0.16 and fork → 0.0.17. The Dotrix Chat suites ran 157 passed and 1 failed, the truncation assertion described in G1.
+- The rebuilt ReleaseSafe `fx` binary passed all 9 `DOTRIX_TEST_FX` native and ACP driver tests.
+
+macOS arm64 and hosted CI have not run.
+
 ## Decisions still open
 
 1. The private SDK package name, scope, registry, and how CI and the backend image authenticate to it. The published layout also names platform packages `@libfx/*` in `sdk/node.js`, so a rename must change the loader too.
 2. The version scheme for fork artifacts, and how the source commit is recorded with each one. `0.0.17-dotrix.1` was a local placeholder.
-3. Whether G1 is fixed in the runtime (preferred) or worked around in the host first.
+3. G1 was fixed in the runtime, as preferred. The [integration plan](DOTRIX_KAI_INTEGRATION_PLAN.md) orders the remaining fork and Dotrix work.
 
 ## Reproduce
 

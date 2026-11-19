@@ -481,6 +481,10 @@ pub const Opened = struct {
     /// The host's ids for the open turn and the last turn that ended.
     open_turn_id: TurnId = .{},
     last_turn_id: TurnId = .{},
+    /// The last turn that ended is an answer the provider stopped at its
+    /// output limit, so a retried prompt reports that instead of a
+    /// completed turn.
+    last_turn_output_limited: bool = false,
     /// The open turn yielded; the resume continues it without the notice.
     yielded: bool = false,
     /// What the snapshot recorded about the agent that saved it, owned by the
@@ -753,8 +757,18 @@ pub fn open(
     // An image the open resolved is in the store; one it read inline is not.
     if (image_store) for (images.resolved.keys()) |name| try state.stored_images.add(session_alloc, name);
     try state.dropOutsideWindow(alloc, alloc, runtime.agent.history.items);
+    // The history's last turn is the one `last_turn_id` names: a turn
+    // that ends appends it, and nothing else follows it.
+    const last_output_limited = folded.history.len > 0 and
+        session_codec.turnIsOutputLimited(folded.history[folded.history.len - 1]);
     const checkpoint = folded.open_turn orelse {
-        return .{ state, .{ .turns = folded.history.len, .resumable = false, .last_turn_id = state.last_turn_id, .checkpoint_meta = saved_meta } };
+        return .{ state, .{
+            .turns = folded.history.len,
+            .resumable = false,
+            .last_turn_id = state.last_turn_id,
+            .last_turn_output_limited = last_output_limited,
+            .checkpoint_meta = saved_meta,
+        } };
     };
 
     debug_trace.logf("session", "event=libfx_journal_open_turn turn={d} running_calls={d} finished_calls={d} resolved=pending_resume", .{ folded.cursor.turn, folded.running_calls.len, folded.finished.len });
@@ -774,6 +788,7 @@ pub fn open(
         .resumable = true,
         .open_turn_id = state.open_turn_id,
         .last_turn_id = state.last_turn_id,
+        .last_turn_output_limited = last_output_limited,
         .yielded = folded.yielded,
         .checkpoint_meta = saved_meta,
     } };
