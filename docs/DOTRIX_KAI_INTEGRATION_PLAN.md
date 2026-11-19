@@ -44,6 +44,10 @@ Each item says what already exists, what changes, and the evidence that closes i
 
 **Evidence.** ACP test: the model request carries the host profile's prompt and tool list. Dotrix test: the digest is pinned and a mismatch fails closed.
 
+**Done (2026-11-19), without a fork change.** A `~/.fx/agents/main` folder can't carry it: `profiles.load` always returns fx's own `main`, and ACP sessions run in `main`. ACP already takes a client system profile instead: `systemPrompt` on `session/new` (appended, at most 64 KiB, `acp/client_instructions.zig`). fx saves it with the session and restores it on `session/resume` and `session/load` (`restoredClientSystemPrompt`). So Dotrix's brief now ends with Kai's contract (`# How Kai works`: role with layered guidance, platform rules, definition of done), the driver sends it as `systemPrompt` for a new session and the task as the prompt, and a resumed session keeps the profile it started with. The driver saves the profile's SHA-256 beside fx's session id and reports it in `started`. Dotrix records it on `coding_sessions.profile_digest` and passes it back, and saved state with another profile never runs a turn. Evidence: Dotrix's `test_fx_coding.py` (a fake `fx acp`: the prompt sent, the digest saved, a matching resume, a mismatch refused before any prompt) and `test_the_real_engine_sends_kai_s_profile_to_the_model_and_keeps_it_on_resume` (this fork's fx: the contract is in the model request's system message, and after a resume in a new process it still is, while a changed contract isn't); `test_coding.py` for the digest kept only while the worker holds the run.
+
+Not yet: tools filtered by work mode. Plan turns still run every engine under Dotrix's read-only Landlock wrapper rather than an fx mode; worker profiles (D4); and local turns (`dotrix_cli/fx_local.py`), which keep the whole brief in the prompt.
+
 ### D3. Nova and the named specialists stay Dotrix-scheduled
 
 **Decision.** Keep Lyra, Orion, Vega, Juno, and Echo as Dotrix scheduler tasks, each a separate SDK engine with its own journal, contract, model, and key. This is already built (`delegation.py`, `specialist_sessions.py`) with leases, fencing, and continuity checks the runtime's subagent host doesn't have. Do not move named specialists onto in-process runtime children.
@@ -113,7 +117,7 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | 2 | Fork, then Dotrix | D1 (done) | ACP probe through the Dotrix driver, e2e and unit tests |
 | 3 | Fork, then Dotrix | D4 audit (done), `max_subagents`, worker activity in Codes | `tool_host.zig` tests; Dotrix driver test; probes through the Dotrix driver |
 | 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact. Done: Dotrix #281 pins `@kunemi-group/kai@0.0.17-kai.1`. |
-| 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary. The binary part is done: Dotrix #282 installs `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1` in the coding image, pinned by SHA-256, and refuses an fx without `project_config` (upstream 0.0.17 reports the same version). D2 profiles and their digest are next. |
+| 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary. Done: D2's profile and digest (above) and the binary part: Dotrix #282 installs `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1` in the coding image, pinned by SHA-256, and refuses an fx without `project_config` (upstream 0.0.17 reports the same version). |
 | 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children |
 | 7 | Both | D7 recovery fixtures, Phase 2 provider checks | Cross-version and provider matrices |
 | 8 | Both | Retire legacy engines, then branding | Per the [migration plan](DOTRIX_KAI_MIGRATION_PLAN.md) |
