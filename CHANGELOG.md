@@ -21,6 +21,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 - libfx is published privately to GitHub Packages as `@kunemi-group/kai`, in the kunemi-group organisation, with one `@kunemi-group/kai-<platform>` package per platform, by the manual workflow `publish-private-libfx.yml` or `scripts/package-private-libfx.sh` run locally. Versions follow the fx release they build on, as `0.0.17-kai.<n>`. libfx lists each platform package as an npm alias under its usual `@libfx/` name, so `node.js` loads it unchanged; each package records the commit it was built from, and a version already published is never replaced. `package-libfx.mjs` takes this as `LIBFX_SCOPE`, `LIBFX_NAME`, `LIBFX_REGISTRY`, and `LIBFX_SOURCE_COMMIT`; the workflow publishes with the `KAI_PACKAGES_TOKEN` secret. `0.0.17-kai.1` is published, from commit `925598b4`.
 - The fx command for Dotrix's coding image is published the same way, as `@kunemi-group/kai-cli-linux-x64` and `@kunemi-group/kai-cli-linux-arm64`: static builds (ReleaseSafe, baseline CPU, musl, as fx's own Linux releases are), each with its binary's SHA-256 in `fx.sha256`, by `scripts/package-private-cli.sh` and the same workflow.
+- Each published version is tagged `v<version>` with a GitHub release by the manual workflow `kai-release.yml`, from `docs/releases/v<version>.md`; `v0.0.17-kai.1` is the first.
 - The upstream publishing workflows (release, dev release, libfx to npm, CDN backfill) run only in `vercel-labs/fx`, so the fork never publishes under fx's names.
 
 ### Tests and docs
