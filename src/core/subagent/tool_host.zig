@@ -209,6 +209,10 @@ pub const Runtime = struct {
     pending: std.ArrayList(Pending) = .empty,
     /// The children whose slot is running their work, between works too.
     busy: std.ArrayList([]u8) = .empty,
+    /// Most children working at once, the host's `max_subagents`; 0 means no
+    /// limit. A message that would start another child's work past it is
+    /// refused, so a host can bound what one session spends in parallel.
+    max_running: usize = 0,
     /// The tool call that sent each work still running or waiting, so its
     /// report can point back at it. Guarded by `admission_mutex`.
     work_calls: std.ArrayList(WorkCall) = .empty,
@@ -739,10 +743,14 @@ pub const Runtime = struct {
                     } });
                     return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
                 },
-                .rejected => |failure| return self.encodeManaged(alloc, .{
-                    .ok = false,
-                    .error_code = failure.code,
-                }),
+                .rejected => |failure| {
+                    var buf: [limit_result_bytes]u8 = undefined;
+                    return self.encodeManaged(alloc, .{
+                        .ok = false,
+                        .error_code = failure.code,
+                        .result = if (std.mem.eql(u8, failure.code, too_many_subagents)) self.limitResult(&buf) else null,
+                    });
+                },
                 .ready => |ready| {
                     keep_call = true;
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
@@ -2292,6 +2300,9 @@ pub const Runtime = struct {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+        // Checked before admission records anything, under the same lock as
+        // the start, so parallel calls can't pass it together.
+        if (try self.overRunningLimitLocked(alloc, request)) return managedAdmissionRejected(alloc, null, too_many_subagents);
         var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model);
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
@@ -2308,6 +2319,27 @@ pub const Runtime = struct {
             } else debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=next_turn", .{ child_id, operation_id });
         }
         return admitted;
+    }
+
+    /// Whether `request` would start work on one more child while
+    /// `max_running` already work. A message to a child that is working waits
+    /// for its next turn, so it adds none. Call with `admission_mutex` held.
+    /// What the model reads when `max_running` turned its message away.
+    fn limitResult(self: *const Runtime, buf: []u8) []const u8 {
+        return std.mem.print(buf, "{d} subagents are already working, the most this session allows. Wait for a report, or send this to one that is working; it reads it on its next turn.", .{self.max_running}) catch "Too many subagents are already working.";
+    }
+
+    fn overRunningLimitLocked(self: *Runtime, alloc: Allocator, request: model_contract.Request) !bool {
+        if (self.max_running == 0 or request != .message) return false;
+        if (self.busy.items.len < self.max_running) return false;
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        if (registry.findPersistent(request.message.agent)) |child| {
+            if (self.isBusyLocked(child.id)) return false;
+        }
+        return true;
     }
 
     fn admitManagedWork(
@@ -2841,6 +2873,40 @@ test "a message past a busy subagent's full queue is refused to its sender" {
     _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-stop", null);
     fixture.release.set(io_mod.getIo());
     try waitUntilQuiet(runtime);
+}
+
+test "max_running refuses another subagent's work while that many work, and a busy one still takes messages" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    runtime.max_running = 1;
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    // A second subagent would be one more working at once: refused, with what to do instead.
+    const refused = try callTool(runtime, arena, .{ .message = .{ .agent = "tester", .message = "also" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, refused, "\"error_code\":\"too_many_subagents\"") != null);
+    try std.testing.expect(std.mem.find(u8, refused, "1 subagents are already working") != null);
+    for (runtime.work_calls.items) |entry| try std.testing.expect(!std.mem.eql(u8, entry.call_id, "call-2"));
+    // The working one still takes a message for its next turn.
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    // Once nothing works, the other subagent starts.
+    const started = try callTool(runtime, arena, .{ .message = .{ .agent = "tester", .message = "now" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, started, "Sent to tester") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 3), fixture.runs.load(.seq_cst));
 }
 
 fn reviewerId(runtime: *Runtime, arena: Allocator) ![]const u8 {
@@ -4062,6 +4128,11 @@ const StartWait = struct {
     closed: bool = false,
 };
 const sent_result_bytes = 256 + domain.max_agent_name_bytes;
+
+/// The error code for a message refused because `max_running` children
+/// already work.
+const too_many_subagents = "too_many_subagents";
+const limit_result_bytes = 256;
 
 /// `message`'s answer when the child takes it now.
 fn sentResult(buf: []u8, agent: []const u8) []const u8 {

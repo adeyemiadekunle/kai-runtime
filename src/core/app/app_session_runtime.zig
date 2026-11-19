@@ -4721,6 +4721,7 @@ pub fn Runtime(comptime App: type) type {
             };
             agent.session_persistence.v2_children = children;
             bindToolboxBehind(app, agent.session_persistence.subagent_host.?);
+            if (comptime @hasField(App, "max_subagents")) agent.session_persistence.subagent_host.?.max_running = app.max_subagents;
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;

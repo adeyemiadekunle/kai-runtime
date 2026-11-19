@@ -60,6 +60,23 @@ Each item says what already exists, what changes, and the evidence that closes i
 
 **Evidence.** ACP tests for a child refused when it asks for more permission or tools than its parent, a limit exceeded, cancellation reaching every child, and child events visible in `session/update`. Then a Dotrix test mapping child events into the coding run's steps.
 
+**Audit (19 November 2026).** Checked in the source and by driving the fork binary through Dotrix's own cloud driver with a scripted model:
+
+| Concern | What the fork does | Result |
+| --- | --- | --- |
+| Depth | Two levels: a subagent's own host clears `children_nest`, so its children never get `subagent` (`authority.zig`) | Bounded |
+| Permissions and tools | A child's mode can't exceed its parent's (`admitChildPermission`); a profile narrows its tools | Bounded |
+| Stop | `session/cancel` ends the turn as `cancelled`; a child's `sleep 20; touch marker` never wrote its marker and left no process | Works |
+| A turn that ends while a child works | The turn waits for the child's report and its answer before `end_turn` | Works |
+| Workers at once | Only the 256-child registry cap | **Added `max_subagents`** |
+| Steps per child | Children inherit `max_agent_steps` | Unchanged; Dotrix sets no step limit today |
+| Per-child time and tokens | No per-child budget | Open; bounded today by the turn's own limits |
+| Visibility | A child's tool calls are not `session/update`s, but fx's opt-in `libfx/hook` events carry them, with each child's session and the `delegation` that started it | **Dotrix's driver now maps them** |
+
+`max_subagents` is a profile-only setting (0, the default, means no limit). Under the admission lock, before admission records anything, a message that would start work on one more child while that many work is refused with `too_many_subagents` and a sentence telling the model to wait for a report or message a working one. A message to a working child still queues for its next turn. Tested in `tool_host.zig`. Dotrix's cloud driver and local profile set it to 2, Dotrix's bound for parallel builds.
+
+Dotrix's driver asks each session for hook events with `captureContent`, maps a child's `tool.start` and `tool.end` to the same `tool` and `tool_result` events as the main session's, and names the worker on each step ("Ran pytest -q (tester)"). It also fixes the description of a `subagent` call, which read "Asked a subagent to" with nothing after it for fx 0.0.17's arguments.
+
 ### D5. Pinned skills
 
 **What exists.** Skill discovery and on-demand loading. Dotrix already pins its own skill catalogue per run and materializes it outside the repository.
@@ -67,6 +84,8 @@ Each item says what already exists, what changes, and the evidence that closes i
 **Change.** With D1, a host-named skill root is the only source. Record each skill's content hash in the journal or session metadata only if a Dotrix consumer needs proof of what was loaded; otherwise keep the pin on the Dotrix side.
 
 **Evidence.** An ACP test where the host root's skill loads and a repository skill of the same name does not.
+
+**Status (19 November 2026): met for coding, no fork change.** Dotrix doesn't use fx's skill loading for Kai: `modules/coding/skills.py` writes the run's pinned skills, checked against their SHA-256, into a fresh read-only `/tmp/dotrix-skills-*` folder outside the repository, and the brief names them for Kai to read as files. With D1 the repository's skill folders no longer load, so only Dotrix's pinned copies reach the model. Chat's skills are host tools (`read_skill`) with role filters, unaffected by fx's skill roots.
 
 ### D6. Execution events
 
@@ -90,7 +109,7 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | --- | --- | --- | --- |
 | 1 | Fork | G1 fix | Zig and SDK tests; the Dotrix harness passes in every direction. Done in this branch, pending CI. |
 | 2 | Fork, then Dotrix | D1 (done) | ACP probe through the Dotrix driver, e2e and unit tests |
-| 3 | Fork | D4 limits audit and any missing host-set limits | ACP child tests |
+| 3 | Fork, then Dotrix | D4 audit (done), `max_subagents`, worker activity in Codes | `tool_host.zig` tests; Dotrix driver test; probes through the Dotrix driver |
 | 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact |
 | 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary |
 | 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children |

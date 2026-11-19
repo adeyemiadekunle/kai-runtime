@@ -232,6 +232,8 @@ pub const StartupState = struct {
     /// applies `--tool-placement` over it.
     tool_placement: config_runtime.tool_placement.Overrides = .{},
     context_enabled: bool = true,
+    /// Most subagents working at once (`max_subagents`); 0 means no limit.
+    max_subagents: usize = 0,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     configured_ultrafast_mode: bool = false,
@@ -900,6 +902,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.tool_placement = settings.tool_placement;
     // Project instructions are the repository's configuration too.
     state.context_enabled = (settings.context orelse true) and project_setting.allowed();
+    state.max_subagents = settings.max_subagents orelse 0;
     const fast_mode = resolveStartupFastMode(
         state.model_source,
         settings.fast_mode,

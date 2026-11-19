@@ -71,6 +71,9 @@ pub const Settings = struct {
     /// Read through `project_config_setting.allowed()`, which also takes FX_PROJECT_CONFIG;
     /// parsed here so a wrong value is reported like any other setting's.
     project_config: ?bool = null,
+    /// Most subagents working at once; 0 or unset means no limit. Profile-only, so a
+    /// repository can't raise what its host chose.
+    max_subagents: ?usize = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
@@ -1948,6 +1951,11 @@ fn parseProfileOnlyFields(
         settings.project_config = value.bool;
     }
 
+    if (root.object.get("max_subagents")) |value| {
+        if (value != .integer or value.integer < 0) return error.InvalidMaxSubagents;
+        settings.max_subagents = std.math.cast(usize, value.integer) orelse return error.InvalidMaxSubagents;
+    }
+
     if (root.object.get("update_channel")) |update_channel_value| {
         const value = update_channel_value;
         if (value != .string) return error.InvalidUpdateChannelType;
@@ -2180,6 +2188,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.project_config) |value| target.project_config = value;
+    if (incoming.max_subagents) |value| target.max_subagents = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.theme) |value| {
         if (target.theme) |old| alloc.free(old);

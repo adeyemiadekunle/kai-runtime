@@ -584,6 +584,7 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initMode(app, agent, permission_mode);
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
+            if (comptime @hasField(App, "max_subagents")) app.max_subagents = startup.max_subagents;
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;

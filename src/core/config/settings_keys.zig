@@ -125,6 +125,7 @@ pub const keys = [_]Key{
     .{ .name = "grok_model", .where = .profile, .kind = .string, .superseded_by = "models.grok", .description = "Older form of models.grok" },
     .{ .name = "input_appearance", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "max_agent_steps", .where = .project_safe, .kind = .integer, .minimum = 0, .description = "Most agent steps per turn; 0 means no limit" },
+    .{ .name = "max_subagents", .where = .profile, .kind = .integer, .minimum = 0, .description = "Most subagents working at once; 0 means no limit" },
     .{ .name = "max_tool_result_bytes", .where = .project_safe, .kind = .integer, .minimum = 1024, .description = "Tool output budget in model context, in bytes" },
     .{ .name = "maxxing_mode", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "model", .where = .profile, .kind = .string, .superseded_by = "models.gateway", .description = "Older form of models.gateway" },
