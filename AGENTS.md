@@ -2,6 +2,15 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## Dotrix and Kai direction
+
+The private `adeyemiadekunle/kai-runtime` repository is canonical. Its `main` branch starts from upstream fx v0.0.17 with the printf backport. Follow the phase order in the [migration plan](docs/DOTRIX_KAI_MIGRATION_PLAN.md), using the [runtime direction](docs/KAI_DOTRIX_NEW_DIRECTION.md) and [skills and browser architecture](docs/DOTRIX_KAI_SKILLS_BROWSER_ARCHITECTURE.md) for design context.
+
+- Use one runtime implementation for Nova in Chat and Kai in Codes. Keep histories and permissions separate. Dotrix owns identities, approvals, specialist scheduling, and linked handoffs. The runtime owns agent turns and session recovery.
+- Reuse the embedded SDK for Chat and ACP for Codes. Verify provider capabilities, host permissions, and recovery before replacing legacy integrations. New Chat work moves to the fork SDK. Preserve the recovery path for existing libfx 0.0.16 sessions.
+- Keep `fx`, `libfx`, `FX_*`, `.fx`, and stored runtime identifiers through the functional migration. Branding is the final phase.
+- Run focused checks locally while GitHub Actions is disabled for the private fork. Record the exact commit, platform, and tests run. Report outstanding platform and CI verification explicitly.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.
