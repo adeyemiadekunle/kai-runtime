@@ -103,6 +103,8 @@ Dotrix's driver asks each session for hook events with `captureContent`, maps a 
 
 Private package name, scope, registry, and CI credentials; a version scheme that records the source commit; publishing workflows replaced; Linux arm64 and macOS builds. These are owner decisions (see [decisions](DOTRIX_KAI_PHASE1_COMPATIBILITY.md#decisions-still-open)).
 
+**Decided and done.** GitHub Packages in the kunemi-group organisation: the SDK as `@kunemi-group/kai` with `@kunemi-group/kai-<platform>` packages, and the fx command as `@kunemi-group/kai-cli-linux-x64` and `-arm64`. Versions are `<fx release>-kai.<n>`, each package records its commit in `gitHead`, and a published version is never replaced (`publish-private-libfx.yml`, `scripts/package-private-libfx.sh`, `scripts/package-private-cli.sh`). The upstream publishing workflows run only in `vercel-labs/fx`. Consumers need a token with `read:packages` (`KAI_PACKAGES_TOKEN`). Still open: hosted CI runs of the macOS and arm64 builds, and macOS signing if a Kai command is ever shipped for macOS.
+
 ## Order
 
 | Step | Repository | Items | Exit evidence |
@@ -110,7 +112,7 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | 1 | Fork | G1 fix | Zig and SDK tests; the Dotrix harness passes in every direction. Done in this branch, pending CI. |
 | 2 | Fork, then Dotrix | D1 (done) | ACP probe through the Dotrix driver, e2e and unit tests |
 | 3 | Fork, then Dotrix | D4 audit (done), `max_subagents`, worker activity in Codes | `tool_host.zig` tests; Dotrix driver test; probes through the Dotrix driver |
-| 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact |
+| 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact. Done: Dotrix #281 pins `@kunemi-group/kai@0.0.17-kai.1`. |
 | 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary |
 | 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children |
 | 7 | Both | D7 recovery fixtures, Phase 2 provider checks | Cross-version and provider matrices |
