@@ -608,6 +608,8 @@ pub const Reducer = struct {
     reasoning_details: ReasoningPart = .{},
     reasoning_bytes: usize = 0,
     refusal_seen: bool = false,
+    /// A tool-call delta came without an `index`, as Gemini sends them (`unindexed_tool`).
+    unindexed_tool_calls: bool = false,
     finish_reason: ?types.ProviderFinishReason = null,
     phase: enum { receiving, finished, done, closed } = .receiving,
     event_count: usize = 0,
@@ -801,13 +803,15 @@ pub const Reducer = struct {
         if (value != .array) return error.InvalidChunk;
         if (value.array.items.len > self.limits.tool_calls) return error.TooManyTools;
         if (value.array.items.len != 0 and self.choice == .none) return error.UnexpectedToolCall;
-        for (value.array.items, 0..) |item, delta_index| {
+        // Indexes this chunk has given its deltas, so two deltas in one chunk never share a call.
+        var placed: std.ArrayList(usize) = .empty;
+        defer placed.deinit(self.alloc);
+        for (value.array.items) |item| {
             const delta = try object(item);
-            const index = try index_value(delta.get("index") orelse return error.InvalidChunk);
+            const index = if (delta.get("index")) |raw| try index_value(raw) else try self.unindexed_tool(delta);
             if (index >= self.limits.tool_calls) return error.TooManyTools;
-            for (value.array.items[0..delta_index]) |prior| {
-                if (try index_value((try object(prior)).get("index") orelse return error.InvalidChunk) == index) return error.ConflictingIdentity;
-            }
+            for (placed.items) |prior| if (prior == index) return error.ConflictingIdentity;
+            try placed.append(self.alloc, index);
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
@@ -824,6 +828,23 @@ pub const Reducer = struct {
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
         }
+    }
+
+    /// The call a tool-call delta without an `index` belongs to. Gemini's OpenAI-compatible endpoint sends each
+    /// call whole with its `id` and no `index`, so a delta goes to the call with its `id`, or a new one after the
+    /// last. A delta with neither continues the last call; the first can't. Marks the reply, so `finish` reads
+    /// Gemini's `stop` as `tool_calls`.
+    fn unindexed_tool(self: *Reducer, delta: std.json.ObjectMap) Error!usize {
+        self.unindexed_tool_calls = true;
+        if (non_null(delta, "id")) |id_value| {
+            const id = try string(id_value);
+            for (self.tools.items, 0..) |tool, index| {
+                if (tool.id != null and std.mem.eql(u8, tool.id.?, id)) return index;
+            }
+            return self.tools.items.len;
+        }
+        if (self.tools.items.len == 0) return error.InvalidChunk;
+        return self.tools.items.len - 1;
     }
 
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
@@ -881,7 +902,10 @@ pub const Reducer = struct {
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed) return error.StreamClosed;
         if (self.phase != .done) return error.IncompleteStream;
-        const reason = self.finish_reason.?;
+        var reason = self.finish_reason.?;
+        // Gemini ends a reply that calls tools with `stop` (and sends the calls without indexes): a finished reply
+        // with calls, as `tool_calls` says elsewhere. Indexed calls ending in `stop` still disagree.
+        if (reason == .stop and self.unindexed_tool_calls and self.tools.items.len != 0) reason = .tool_calls;
         switch (reason) {
             .content_filter => return error.ContentFiltered,
             .stop, .tool_calls, .length => {},
@@ -2289,6 +2313,56 @@ test "chat completions terminal evidence and finish reasons are strict" {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, test_tools_finish));
+    }
+}
+
+test "chat completions accepts Gemini's tool calls without indexes and its stop" {
+    const alloc = std.testing.allocator;
+    // Gemini's OpenAI-compatible stream: each call whole, with an id and no index, then `stop`.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[" ++
+            "{\"id\":\"g-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}," ++
+            "{\"id\":\"g-2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"b\\\"}\"}}]}}]}");
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        const completion = result.completed.completion;
+        try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+        try std.testing.expectEqualStrings("g-1", completion.tool_calls[0].id);
+        try std.testing.expectEqualStrings("{\"path\":\"b\"}", completion.tool_calls[1].arguments_json);
+    }
+    // Across chunks: the same id continues its call, a delta with neither index nor id continues the last one.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"g-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}");
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"g-1\",\"function\":{\"arguments\":\"th\\\":\"}}]}}]}");
+        try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]}}]}");
+        var result = try test_finish(&reducer, test_stop);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+        try std.testing.expectEqualStrings("{\"path\":\"a\"}", result.completed.completion.tool_calls[0].arguments_json);
+    }
+    // A first delta with neither index nor id has no call to join.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try std.testing.expectError(error.InvalidChunk, reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"read_file\"}}]}}]}", false));
+    }
+    // Two deltas in one chunk for the same call still conflict.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try std.testing.expectError(error.ConflictingIdentity, reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"g-1\"},{\"id\":\"g-1\"}]}}]}", false));
+    }
+    // Indexed calls ending in `stop` still disagree, as before.
+    {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_call);
+        try std.testing.expectError(error.InconsistentFinishReason, test_finish(&reducer, test_stop));
     }
 }
 
