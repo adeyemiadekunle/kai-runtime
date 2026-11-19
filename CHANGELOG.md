@@ -1,5 +1,27 @@
 # fx
 
+## Unreleased
+
+Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.17 release, not yet in a release. The release workflow publishes only the notes between the release markers below, so this section isn't published until it becomes a version.
+
+### New Features
+
+- `max_subagents` caps how many subagents work at once; 0, the default, means no limit. It is profile-only, so a repository can't raise it. A message that would start one more is refused with `too_many_subagents` and a sentence telling the model to wait for a report or message a working one; a message to a working subagent still waits for its next turn. ACP, `fx ask`, and the TUI read it, and `fx config get max_subagents` shows it.
+
+### Bug Fixes
+
+- An answer the provider cut off at its output limit is no longer replayed as a completed answer. Retrying that turn by ID, after a restart or in the same process, reports `max_output_tokens` instead of `end_turn`. The saved turn records `output_limited`, so a journal or checkpoint holding one is version 5, which fx 0.0.16 and 0.0.17 refuse as newer rather than misread. Journals written by fx 0.0.17 before this fix never recorded the cutoff.
+- `printf` with data that starts with `--` takes the shell path instead of running `/usr/bin/printf` directly, which on uutils read it as an option (the upstream repair, backported).
+
+### Security
+
+- `project_config` (profile-only, on by default) and `FX_PROJECT_CONFIG` let a host stop fx taking configuration from the repository it works in: its `.fx.json` settings, `.fx/agents` profiles, skill folders, `.mcp.json` servers, and project instructions such as `AGENTS.md`, subfolder ones included. A repository can't turn it back on. Its files stay readable through the agent's tools as data. Dotrix's coding sandbox sets it, since a probe showed a repository's `AGENTS.md` and skills reaching the model there.
+
+### Tests and docs
+
+- E2E: `project-config.test.ts`; journal tests for cut-off turns; released 0.0.16 and 0.0.17 journal fixtures; Zig tests for the new saved-format versions, the gated loaders, and `max_subagents`.
+- Docs: the Dotrix migration plan, Phase 1 compatibility results, the integration plan, and the local CI record kept while GitHub Actions is unavailable. `.gitignore` covers Python `__pycache__`.
+
 ## 0.0.17
 
 <!-- release:start -->
