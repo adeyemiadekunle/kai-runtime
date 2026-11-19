@@ -10,6 +10,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 ### Bug Fixes
 
+- Over ACP, the `subagent` tool now lists the agent profiles a subagent can start in (the user's `~/.fx/agents`, and the repository's when `project_config` allows), as `fx` itself does. Before, an ACP host's profiles could be started by name, but the model was never told they existed.
 - An answer the provider cut off at its output limit is no longer replayed as a completed answer. Retrying that turn by ID, after a restart or in the same process, reports `max_output_tokens` instead of `end_turn`. The saved turn records `output_limited`, so a journal or checkpoint holding one is version 5, which fx 0.0.16 and 0.0.17 refuse as newer rather than misread. Journals written by fx 0.0.17 before this fix never recorded the cutoff.
 - `printf` with data that starts with `--` takes the shell path instead of running `/usr/bin/printf` directly, which on uutils read it as an option (the upstream repair, backported).
 

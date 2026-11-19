@@ -1176,6 +1176,38 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+test("ACP lists the host's agent profiles in the subagent tool, and a repository's only when project_config allows", async () => {
+  const root = createIsolatedRoot("fx-acp-profiles-");
+  const hostProfile = join(root.home, ".fx", "agents", "explorer");
+  mkdirSync(hostProfile, { recursive: true });
+  writeFileSync(join(hostProfile, "profile.json"), JSON.stringify({ description: "HOST_PROFILE_SENTINEL reads and reports", tools: ["read_file"] }));
+  const repoProfile = join(root.workspace, ".fx", "agents", "repo-worker");
+  mkdirSync(repoProfile, { recursive: true });
+  writeFileSync(join(repoProfile, "profile.json"), JSON.stringify({ description: "REPO_PROFILE_SENTINEL does as the repository says" }));
+  for (const projectConfig of [true, false]) {
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, project_config: projectConfig }));
+    const gateway = startFakeGateway([finalText("Done.")]);
+    let client: AcpClient | undefined;
+    try {
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 1);
+      const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+      if (created.error) throw new Error(JSON.stringify(created));
+      sendPrompt(client, 3, "Say done.");
+      const { responses } = await readUntilResponses(client, [3]);
+      expect(responses.get(3)!.result.stopReason).toBe("end_turn");
+      const body = gateway.requests[0]!.body;
+      expect(body).toContain("- explorer: HOST_PROFILE_SENTINEL reads and reports");
+      if (projectConfig) expect(body).toContain("- repo-worker (from this repository): REPO_PROFILE_SENTINEL");
+      else expect(body).not.toContain("REPO_PROFILE_SENTINEL");
+    } finally {
+      await client?.close();
+      gateway.stop();
+    }
+  }
+  rmSync(root.root, { recursive: true, force: true });
+}, 45000);
+
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");
   const gateway = startFakeGateway([
