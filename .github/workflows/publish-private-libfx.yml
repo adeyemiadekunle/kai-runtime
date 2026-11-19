@@ -1,7 +1,8 @@
 name: Publish private libfx
 
 # The Kai runtime's libfx, published to GitHub Packages as @kunemi-group/kai
-# and one @kunemi-group/kai-<platform> package per platform. The repository's
+# and one @kunemi-group/kai-<platform> package per platform, and the fx command
+# for Dotrix's coding image as @kunemi-group/kai-cli-linux-x64 and -arm64. The repository's
 # GITHUB_TOKEN can't publish to the kunemi-group organisation, so the
 # KAI_PACKAGES_TOKEN secret holds a token with write:packages there. Dotrix's Chat host installs it from there. Started by hand, from a
 # commit on main, with a version such as 0.0.17-kai.1; a version already
@@ -93,8 +94,34 @@ jobs:
           path: native-addons/libfx.${{ matrix.package_platform }}.node
           if-no-files-found: error
 
+  cli:
+    needs: metadata
+    name: fx command (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.0"
+      # Static builds, as fx's own Linux releases are, for Dotrix's coding image.
+      - name: Build fx for Linux x64 and arm64
+        run: |
+          mkdir -p fx-bins
+          for arch in x86_64 aarch64; do
+            zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dupdate-channel=stable -Dtarget=${arch}-linux-musl
+            cp zig-out/bin/fx fx-bins/fx-${arch}
+          done
+          scripts/smoke-binary.sh fx-bins/fx-x86_64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kai-cli
+          path: fx-bins/
+          if-no-files-found: error
+
   publish:
-    needs: [metadata, native]
+    needs: [metadata, native, cli]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -127,6 +154,16 @@ jobs:
           LIBFX_SOURCE_COMMIT: ${{ needs.metadata.outputs.sha }}
           NODE_AUTH_TOKEN: ${{ secrets.KAI_PACKAGES_TOKEN }}
         run: scripts/package-private-libfx.sh native-addons out --publish
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kai-cli
+          path: fx-bins
+      - name: Pack and publish the fx command
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          LIBFX_SOURCE_COMMIT: ${{ needs.metadata.outputs.sha }}
+          NODE_AUTH_TOKEN: ${{ secrets.KAI_PACKAGES_TOKEN }}
+        run: scripts/package-private-cli.sh fx-bins out --publish
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libfx-private-packages
@@ -134,4 +171,6 @@ jobs:
             out/*.tgz
             out/native/*.tgz
             out/packages.sha256
+            out/cli/*.tgz
+            out/cli/fx.sha256
           if-no-files-found: error

@@ -82,3 +82,14 @@ Changes only workflows, the packager, its test, a new script, and the changelog.
 | Installed from the registry as `"libfx": "npm:@kunemi-group/kai@0.0.17-kai.1"`: the alias pulls in only the linux-x64 package, and the native backend loads; three archives downloaded from the registry are byte-identical to those built here | Passed |
 
 Hosted CI still has to run the macOS and arm64 addons (`test:node-napi` on each) before Dotrix is deployed on those machines. Dotrix's Chat host runs on Linux x64.
+
+## kai-runtime `413707ee` (fx command packaging) and Dotrix's Chat pin
+
+| Step | Result |
+| --- | --- |
+| `shellcheck` and `bash -n` on `scripts/package-private-cli.sh`; the workflows parse as YAML | Passed |
+| Static fx for Linux x86_64 and aarch64 (`-Doptimize=ReleaseSafe -Dcpu=baseline -Dtarget=<arch>-linux-musl`), source as on `main` at `95d32954` | Built; the arm64 binary wasn't run, since there's no such machine here |
+| `scripts/smoke-binary.sh` on the x86_64 binary | Passed |
+| Dotrix's real-binary tests with it as `fx` (`apps/cli/tests/test_real_local_engines.py`, `test_fx_native.py`: native namespace, protocol, resume, Stop, browser) | 18 passed, 10 skipped (Codex and desktop cases), the same as the earlier glibc build |
+| Dotrix [#281](https://github.com/adeyemiadekunle/dotrix/pull/281), Chat on `@kunemi-group/kai@0.0.17-kai.1`: full `uv run pytest` | 1,645 passed, 146 skipped |
+| Its fx Chat suites, the handoff test, and 0.0.16 → Kai cross-version (4) and restart (5) checks | 160 passed, 2 skipped (paid live-model tests); all passed |
