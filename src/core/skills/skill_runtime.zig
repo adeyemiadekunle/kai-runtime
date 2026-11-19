@@ -1,5 +1,6 @@
 const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
+const project_setting = @import("../config/project_config_setting.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -393,7 +394,9 @@ fn appendConfiguredSkillRoots(
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) !void {
-    if (workspace_root) |root| {
+    // A repository's skill folders are its configuration, which the host may
+    // have turned off.
+    if (workspace_root) |root| if (project_setting.allowed()) {
         try appendWorkspaceRoots(
             alloc,
             roots,
@@ -401,7 +404,7 @@ fn appendConfiguredSkillRoots(
             home,
             root_policy.workspace_roots,
         );
-    }
+    };
     if (root_policy.managed_root_source) |source| {
         try appendDupeRoot(alloc, roots, source, skills_dir);
     }

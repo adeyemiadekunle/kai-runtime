@@ -73,6 +73,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-usage.test.ts",
     "tui-decision-prompts.test.ts",
     "poisoned-repository.test.ts",
+    "project-config.test.ts",
     "tui-file-picker.test.ts",
     "tui-host-instances.test.ts",
     "tui-input-line-delete.test.ts",
@@ -424,7 +425,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(73, len(corpus.candidate_scenarios))
+        self.assertEqual(74, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

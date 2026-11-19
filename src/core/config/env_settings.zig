@@ -8,6 +8,7 @@ const compactor = @import("../compactor/compactor.zig");
 const config_runtime = @import("config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const model_provider = @import("model_provider.zig");
+const project_setting = @import("project_config_setting.zig");
 const settings_store = @import("settings_store.zig");
 const types = @import("../shared/types.zig");
 
@@ -127,6 +128,9 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
     }
     if (getenv("FX_AUTO_UPGRADE")) |raw| {
         if (autoUpgradeOff(raw)) try list.append(arena, .{ .variable = "FX_AUTO_UPGRADE", .key = "auto_upgrade", .value = .{ .bool = false } });
+    }
+    if (getenv(project_setting.env_var)) |raw| {
+        if (project_setting.parseEnv(raw)) |value| try list.append(arena, .{ .variable = project_setting.env_var, .key = project_setting.setting_key, .value = .{ .bool = value } });
     }
     return list.toOwnedSlice(arena);
 }

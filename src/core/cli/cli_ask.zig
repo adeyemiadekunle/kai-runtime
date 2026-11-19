@@ -625,6 +625,8 @@ const AskContext = struct {
     /// duration of the run. Empty keeps the reviewer's compiled default.
     reviewer_model: []const u8 = "",
     agent_step_limit: usize = 0,
+    /// `max_subagents` from the settings; 0 means no limit.
+    max_subagents: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
@@ -1056,6 +1058,7 @@ const AskContext = struct {
         };
         // A child whose profile lists a tool kept behind toolbox keeps toolbox.
         self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
+        self.subagent_host.?.max_running = self.max_subagents;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
         // What a restart left owed runs as this run's next turns.
@@ -1669,6 +1672,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.seed_model = startup.configured_model;
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
+    ctx.max_subagents = startup.max_subagents;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;

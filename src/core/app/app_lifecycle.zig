@@ -4,6 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const env_settings = @import("../config/env_settings.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const project_setting = @import("../config/project_config_setting.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
@@ -231,6 +232,8 @@ pub const StartupState = struct {
     /// applies `--tool-placement` over it.
     tool_placement: config_runtime.tool_placement.Overrides = .{},
     context_enabled: bool = true,
+    /// Most subagents working at once (`max_subagents`); 0 means no limit.
+    max_subagents: usize = 0,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     configured_ultrafast_mode: bool = false,
@@ -897,7 +900,9 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.tool_placement = settings.tool_placement;
-    state.context_enabled = settings.context orelse true;
+    // Project instructions are the repository's configuration too.
+    state.context_enabled = (settings.context orelse true) and project_setting.allowed();
+    state.max_subagents = settings.max_subagents orelse 0;
     const fast_mode = resolveStartupFastMode(
         state.model_source,
         settings.fast_mode,

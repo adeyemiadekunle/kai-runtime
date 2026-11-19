@@ -10,6 +10,7 @@ The private `adeyemiadekunle/kai-runtime` repository is canonical. Its `main` br
 - Reuse the embedded SDK for Chat and ACP for Codes. Verify provider capabilities, host permissions, and recovery before replacing legacy integrations. New Chat work moves to the fork SDK. Preserve the recovery path for existing libfx 0.0.16 sessions.
 - Keep `fx`, `libfx`, `FX_*`, `.fx`, and stored runtime identifiers through the functional migration. Branding is the final phase.
 - Run focused checks locally while GitHub Actions is disabled for the private fork. Record the exact commit, platform, and tests run. Report outstanding platform and CI verification explicitly.
+- Record every fork change under `## Unreleased` at the top of `CHANGELOG.md`, above the release markers, and the matching Dotrix change under Unreleased in Dotrix's changelog. Record local CI results in `docs/DOTRIX_KAI_LOCAL_CI.md`.
 
 ## Declaring Work Ready
 

@@ -29,6 +29,8 @@ Dotrix Chat 0.0.16 is historical input for state compatibility, not the runtime 
 | Recover | Dotrix reacquires the lease and resumes through the pinned journal reader. Tool execution IDs remain linked to the host ledger. | The worker restores the pinned environment and state, then resumes the recorded ACP session. |
 | Approve and hand off | Dotrix owns the decision and passes approved effects through its existing tool handlers. | The worker receives a scoped brief and publishes a linked outcome through Dotrix policy. |
 
+[Phase 1 results](DOTRIX_KAI_PHASE1_COMPATIBILITY.md) record the cross-version evidence and the gap list. The output-limit journal gap (G1) is fixed in the fork. The [integration plan](DOTRIX_KAI_INTEGRATION_PLAN.md) orders the remaining fork and Dotrix work, starting with host-owned configuration for Codes.
+
 Use the existing SDK and ACP adapters for this phase. Add a shared transport or event field only when a verified consumer needs it. Preserve identifiers across retries and distinguish stream loss from cancellation. **R1.4, R1.8, R2.4, R3.3, R3.6, R6.3.**
 
 Move Dotrix Chat and Codes to one private Kai runtime. Nova leads Chat with Lyra, Orion, Vega, Juno, and Echo as named specialists. Kai leads Codes in a separate session and isolated worktree. Dotrix owns approvals, model policy, personal provider credentials, scheduling, task state, and audit. Kai runs turns, tools, and session-local recovery.

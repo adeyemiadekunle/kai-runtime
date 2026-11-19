@@ -98,6 +98,13 @@ function framesFor(prompt) {
       { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
     ];
   }
+  // "say too much" runs out of output tokens partway through its answer.
+  if (text === "say too much") {
+    return [
+      { type: "text-delta", id: "answer", delta: "The first half of the answer" },
+      { type: "finish", finishReason: { unified: "length", raw: "length" }, usage },
+    ];
+  }
   if (text === "explain and use the tool") {
     if (toolResults(prompt).length === 0) {
       return [
@@ -882,7 +889,7 @@ test("a journal that does not fold is refused", async () => {
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
   await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
-  const newer = eventJournal([{ ...journal.events[0], v: 5 }]);
+  const newer = eventJournal([{ ...journal.events[0], v: 6 }]);
   await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
@@ -1258,7 +1265,7 @@ test("a turn left open resumes under the tools the new agent has", async () => {
 });
 
 test("a journal from a newer libfx is refused", async () => {
-  const future = eventJournal([{ v: 5, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  const future = eventJournal([{ v: 6, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
   const newer = (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION";
   await assert.rejects(createFxEngine(options(sourceBackend, future)), newer);
   const record = (format) => ({
@@ -2161,6 +2168,62 @@ test("a checkpoint is saved after a turn, and a restore reads it and only the re
   assert.ok(loaded.checkpoint);
   assert.ok(loaded.journal.length > 0 && loaded.journal.length < store.records.length, "a load returns only the records after the checkpoint");
   assertContiguous(storedEvents(store));
+});
+
+test("an answer cut off at the output limit stays cut off when its turn is retried", async () => {
+  const journal = eventJournal();
+  const source = await createFxEngine(options(sourceBackend, journal));
+  await run(source, "remember plums");
+  const cut = source.prompt("say too much", { turnId: "turn-cut" });
+  for await (const _ of cut) {}
+  assert.equal((await cut.result).stopReason, "max_output_tokens");
+  requests.length = 0;
+  // The same agent knows how the turn ended.
+  assert.equal((await source.prompt("say too much", { turnId: "turn-cut" }).result).stopReason, "max_output_tokens");
+  assert.equal(requests.length, 0, "the ended turn did not run again");
+  await source.close();
+
+  const committed = journal.events.filter((event) => event.type === "turn_committed");
+  assert.equal(committed.length, 2);
+  // Only the cut-off turn is marked, at a version an older fx refuses as newer.
+  assert.deepEqual([committed[0].v, committed[0].data.output_limited], [1, undefined]);
+  assert.deepEqual([committed[1].v, committed[1].data.output_limited], [5, true]);
+
+  // An agent opened from the journal knows it too.
+  const target = await createFxEngine(options(targetBackend, journal));
+  assert.equal((await target.prompt("say too much", { turnId: "turn-cut" }).result).stopReason, "max_output_tokens");
+  assert.equal(requests.length, 0, "the ended turn did not run again");
+  // The next turn sees what the cut-off answer said, as before.
+  await run(target, "what did I say");
+  assert.ok(JSON.stringify(requests[0]).includes("The first half of the answer"));
+  // A completed turn after it is retried as completed.
+  const last = target.prompt("remember pears", { turnId: "turn-done" });
+  for await (const _ of last) {}
+  assert.equal((await last.result).stopReason, "end_turn");
+  assert.equal((await target.prompt("remember pears", { turnId: "turn-done" }).result).stopReason, "end_turn");
+  await target.close();
+});
+
+test("a checkpoint keeps an answer cut off at the output limit cut off", async () => {
+  const store = createMemoryPersistence();
+  const source = await createFxEngine(options(sourceBackend, undefined, { persistence: store, checkpointAfterBytes: 0 }));
+  const cut = source.prompt("say too much", { turnId: "turn-cut" });
+  for await (const _ of cut) {}
+  assert.equal((await cut.result).stopReason, "max_output_tokens");
+  await source.close();
+  assert.ok(store.checkpoint, "the store holds a checkpoint");
+  // The checkpoint's version, after its four-byte magic, wherever a snapshot
+  // places the checkpoint.
+  const saved = store.checkpoint.data;
+  const at = Buffer.from(saved).indexOf("FXCP");
+  assert.ok(at >= 0, "the store holds a checkpoint");
+  assert.equal(new DataView(saved.buffer, saved.byteOffset + at).getUint16(4, true), 5);
+
+  const target = await createFxEngine(options(targetBackend, undefined, { persistence: store }));
+  requests.length = 0;
+  assert.equal((await target.prompt("say too much", { turnId: "turn-cut" }).result).stopReason, "max_output_tokens");
+  assert.equal(requests.length, 0, "the ended turn did not run again");
+  await target.close();
 });
 
 test("a checkpoint after a turn counts the records still being stored", async () => {

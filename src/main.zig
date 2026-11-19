@@ -567,6 +567,8 @@ const App = struct {
     permission_engine: PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
+    /// `max_subagents` from the settings; 0 means no limit.
+    max_subagents: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,

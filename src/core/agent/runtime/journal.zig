@@ -39,6 +39,9 @@
 //! An event that names an image instead of holding its bytes, one the host
 //! stored or one the session dropped, is version 3, so an fx that reads only
 //! up to version 2 refuses it as newer.
+//! An event that holds an answer the provider stopped at its output limit is
+//! version 5, so an fx that reads only up to version 4, which would take
+//! that answer for a completed one, refuses it as newer.
 //!
 //! A `turn_progress` event lists the inputs its model request carries for
 //! the first time in `inputs`, so placement is stored with the text it
@@ -57,7 +60,7 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 /// The newest event version this fx reads and writes.
-pub const version: u8 = 4;
+pub const version: u8 = 5;
 /// The version of an event that needs none of the later additions.
 const plain_version: u8 = 1;
 /// The version of a `tool_result` and of a progress that extends another.
@@ -71,6 +74,11 @@ const naming_version: u8 = 3;
 /// runtime context (D93, D94), whatever else it holds, so an fx that reads
 /// only up to version 3 reports a newer journal instead of an invalid one.
 const notes_version: u8 = 4;
+/// The version of an event that holds an answer the provider stopped at its
+/// output limit (`output_limited`), whatever else it holds, so an fx that
+/// reads only up to version 4 reports a newer journal instead of taking the
+/// answer for a completed one.
+const outcome_version: u8 = 5;
 /// The most event bytes one load accepts, and the most bytes one snapshot
 /// holds: each travels as one host attachment, and an attachment holds at
 /// most one kernel checkpoint. Longer sessions need snapshots.
@@ -153,6 +161,7 @@ pub const Event = union(EventType) {
     /// `naming_version` when it names an image, one `stored` holds or one the
     /// session dropped.
     fn eventVersion(self: Event, stored: ?*const session_codec.StoredImages) u8 {
+        if (eventHoldsOutputLimit(self)) return outcome_version;
         if (eventUsesNotesSchema(self)) return notes_version;
         if (eventNamesImages(self, stored)) return naming_version;
         return switch (self) {
@@ -275,6 +284,17 @@ pub const Cursor = struct {
         };
     }
 };
+
+/// Whether `event` holds an answer the provider stopped at its output limit.
+fn eventHoldsOutputLimit(event: Event) bool {
+    return switch (event) {
+        .turn_committed => |turn| session_codec.turnIsOutputLimited(turn),
+        .history_replaced => |history| for (history) |turn| {
+            if (session_codec.turnIsOutputLimited(turn)) break true;
+        } else false,
+        .turn_progress, .tool_result, .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded => false,
+    };
+}
 
 /// Whether `event` holds a turn that `session_codec` writes as execution
 /// schema 11 or 12.
@@ -1446,7 +1466,7 @@ test "a journal from a newer fx or with a malformed event is rejected" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.UnsupportedJournalVersion,
-        fold(alloc, "[{\"v\":5,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
+        fold(alloc, "[{\"v\":6,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
     );
     const malformed = [_][]const u8{
         "{}",
@@ -1990,6 +2010,61 @@ test "a turn with context notes or a saved runtime context is a version 4 event 
     defer alloc.free(snapshot);
     try std.testing.expectEqual(snapshot_notes_version, snapshot[snapshot_magic.len]);
     try std.testing.expectEqualStrings("{}", (try parseSnapshot(snapshot)).open_turn.?);
+}
+
+test "an answer cut off at the output limit is a version 5 event and checkpoint an older fx reports as newer" {
+    const alloc = std.testing.allocator;
+    const plain_turn = try testTurn(alloc, "prompt", "answer");
+    defer types.freeHistoryTurn(alloc, plain_turn);
+    var cut_turn = try testTurn(alloc, "prompt", "the first half");
+    defer types.freeHistoryTurn(alloc, cut_turn);
+    cut_turn.assistant.output_limited = true;
+
+    // A completed answer keeps its bytes: no key, version 1.
+    var plain: std.Io.Writer.Allocating = .init(alloc);
+    defer plain.deinit();
+    _ = try (Cursor{}).write(&plain.writer, .{ .turn_committed = plain_turn });
+    try std.testing.expect(std.mem.startsWith(u8, plain.written(), "{\"v\":1,"));
+    try std.testing.expect(std.mem.find(u8, plain.written(), "output_limited") == null);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    _ = try (Cursor{}).write(&out.writer, .{ .turn_committed = cut_turn });
+    try out.writer.writeByte(']');
+    // An fx that reads up to version 4 returns UnsupportedJournalVersion for
+    // it instead of taking the answer for a completed one.
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "[{\"v\":5,"));
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"output_limited\":true") != null);
+    var folded = try fold(alloc, out.written());
+    defer folded.deinit(alloc);
+    try std.testing.expect(folded.history[0].assistant.output_limited);
+    try std.testing.expectEqualStrings("the first half", folded.history[0].assistant.assistant);
+
+    var replaced: std.Io.Writer.Allocating = .init(alloc);
+    defer replaced.deinit();
+    _ = try (Cursor{}).write(&replaced.writer, .{ .history_replaced = &.{ cut_turn, plain_turn } });
+    try std.testing.expect(std.mem.startsWith(u8, replaced.written(), "{\"v\":5,"));
+
+    const plain_checkpoint = try checkpoint_codec.encode(alloc, &.{plain_turn}, .{}, .{});
+    defer alloc.free(plain_checkpoint);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, plain_checkpoint[4..6], .little));
+    const cut_checkpoint = try checkpoint_codec.encode(alloc, &.{ plain_turn, cut_turn }, .{}, .{});
+    defer alloc.free(cut_checkpoint);
+    try std.testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, cut_checkpoint[4..6], .little));
+    var decoded = try checkpoint_codec.decode(alloc, cut_checkpoint);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(!decoded.history[0].assistant.output_limited);
+    try std.testing.expect(decoded.history[1].assistant.output_limited);
+}
+
+test "a saved turn's output_limited is only ever true" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "[{\"v\":5,\"seq\":1,\"turn\":1,\"type\":\"turn_committed\",\"data\":{\"kind\":\"assistant\",\"user\":{\"text\":\"p\",\"images\":[]},\"assistant\":\"a\",\"provider_replay\":null,\"output_limited\":false,\"execution\":{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}}}]",
+        "[{\"v\":5,\"seq\":1,\"turn\":1,\"type\":\"turn_committed\",\"data\":{\"kind\":\"assistant\",\"user\":{\"text\":\"p\",\"images\":[]},\"assistant\":\"a\",\"provider_replay\":null,\"output_limited\":1,\"execution\":{\"schema_version\":10,\"tool_steps\":[],\"files\":[],\"steering\":[],\"turn_summary\":null}}}]",
+    };
+    for (cases) |bytes| try std.testing.expectError(error.InvalidJournal, fold(alloc, bytes));
 }
 
 test "one fold names every image the host did not stage" {

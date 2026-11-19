@@ -358,6 +358,8 @@ pub const ServerState = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
+    /// `max_subagents` from the settings; 0 means no limit.
+    max_subagents: usize = 0,
     session_titles: bool = true,
     cache_warming: bool = true,
     active_session: ?ActiveSessionState = null,
@@ -812,6 +814,7 @@ fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *s
     };
     // A child whose profile lists a tool kept behind toolbox keeps toolbox.
     state.subagent_host.?.authority_resolver.toolbox_behind = &state.toolbox_behind;
+    state.subagent_host.?.max_running = state.max_subagents;
     state.subagent_host.?.report_sink = .{ .context = state, .post_fn = postAcpReport };
     state.subagent_v2_children = children;
     // What a restart left owed reaches the session as its next turns.
@@ -2076,6 +2079,8 @@ fn handleKernelJournalOpen(
     if (opened.last_turn_id.slice()) |id| {
         try response.writer.writeAll(",\"lastTurnId\":");
         try writeJsonStr(id, &response.writer);
+        // How that turn ended, when it was not a completed answer.
+        if (opened.last_turn_output_limited) try response.writer.writeAll(",\"lastTurnStopReason\":\"max_output_tokens\"");
     }
     // The calls the open turn left running, which the host may have the
     // resume run again instead of leaving them to the model.
@@ -3083,6 +3088,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
+    state.max_subagents = startup.max_subagents;
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
 
