@@ -16,6 +16,7 @@ const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const project_setting = @import("../config/project_config_setting.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -96,10 +97,16 @@ pub const Roots = struct {
 
     /// Builds both roots from the fx home and the workspace. Caller owns the
     /// result through `arena`.
+    /// The repository's `.fx/agents` is left out when the host turned
+    /// `project_config` off.
     pub fn init(arena: Allocator, home: ?[]const u8, workspace_root: ?[]const u8) !Roots {
+        return initFor(arena, home, workspace_root, project_setting.allowed());
+    }
+
+    pub fn initFor(arena: Allocator, home: ?[]const u8, workspace_root: ?[]const u8, use_project: bool) !Roots {
         return .{
             .home = if (home) |path| try profile_paths.agentsDir(arena, path) else null,
-            .project = if (workspace_root) |root|
+            .project = if (!use_project) null else if (workspace_root) |root|
                 try std.Io.Dir.path.join(arena, &.{ root, profile_paths.root_dir_name, profile_paths.agents_dir_name })
             else
                 null,
@@ -709,6 +716,25 @@ test "a repository's profile reads only files inside the repository" {
     // Neither refused profile is offered.
     const entries = try list(arena, roots);
     for (entries) |entry| try testing.expect(!std.mem.eql(u8, entry.name, "evil") and !std.mem.eql(u8, entry.name, "far"));
+}
+
+test "a repository's profiles are left out when the host turns project_config off" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestProfile(tmp.dir, "repo/.fx/agents/planted", "{\"description\": \"Planted\"}");
+    const repo = try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo");
+    var failure: ?[]const u8 = null;
+
+    const trusted = try Roots.initFor(arena, null, repo, true);
+    try testing.expectEqualStrings("Planted", (try load(arena, trusted, "planted", &failure)).description);
+
+    const untrusted = try Roots.initFor(arena, null, repo, false);
+    try testing.expect(untrusted.project == null);
+    try testing.expectError(error.ProfileNotFound, load(arena, untrusted, "planted", &failure));
+    for (try list(arena, untrusted)) |entry| try testing.expect(entry.source != .project);
 }
 
 test "a profile reads only regular files, and the user's own may link anywhere" {

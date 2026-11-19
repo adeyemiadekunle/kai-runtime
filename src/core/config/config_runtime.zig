@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const project_setting = @import("project_config_setting.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -67,6 +68,9 @@ pub const Settings = struct {
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
+    /// Read through `project_config_setting.allowed()`, which also takes FX_PROJECT_CONFIG;
+    /// parsed here so a wrong value is reported like any other setting's.
+    project_config: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
@@ -656,7 +660,8 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     const project_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".fx.json" });
     defer alloc.free(project_path);
-    const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
+    // The host may have turned the repository's configuration off.
+    const project_text = if (!project_setting.allowed()) null else readOptionalFile(alloc, project_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         try diagnostics.append(alloc, .{
             .layer = .project,
@@ -1365,7 +1370,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSettingsShape;
 
-        try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
+        if (project_setting.allowed()) try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
 
         var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
         defer user_settings.deinit(alloc);
@@ -1377,7 +1382,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         return settings;
     }
 
-    try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
+    if (project_setting.allowed()) try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
     try resolve_provider_selection(&settings);
     return settings;
 }
@@ -1400,7 +1405,8 @@ fn loadStartupStatusSettingsFromPathsFast(alloc: Allocator, paths: Paths) !Start
     const user_text = try readOptionalUserSettingsFile(alloc, paths);
     defer if (user_text) |owned| alloc.free(owned);
 
-    if (try readOptionalFile(alloc, paths.workspace_settings)) |workspace_text| {
+    const workspace_file = if (project_setting.allowed()) try readOptionalFile(alloc, paths.workspace_settings) else null;
+    if (workspace_file) |workspace_text| {
         defer alloc.free(workspace_text);
         var workspace_settings = try parseStartupStatusSettingsJson(alloc, workspace_text, null, .project);
         defer workspace_settings.deinit(alloc);
@@ -1937,6 +1943,11 @@ fn parseProfileOnlyFields(
         settings.auto_upgrade = value.bool;
     }
 
+    if (root.object.get("project_config")) |value| {
+        if (value != .bool) return error.InvalidProjectConfigType;
+        settings.project_config = value.bool;
+    }
+
     if (root.object.get("update_channel")) |update_channel_value| {
         const value = update_channel_value;
         if (value != .string) return error.InvalidUpdateChannelType;
@@ -2168,6 +2179,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
+    if (incoming.project_config) |value| target.project_config = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.theme) |value| {
         if (target.theme) |old| alloc.free(old);

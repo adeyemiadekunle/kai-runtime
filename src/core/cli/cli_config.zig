@@ -12,6 +12,7 @@ const output_contracts = @import("../output/output_contracts.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const settings_entries = @import("../config/settings_entries.zig");
 const settings_keys = @import("../config/settings_keys.zig");
+const project_setting = @import("../config/project_config_setting.zig");
 const settings_messages = @import("settings_messages.zig");
 const settings_store = @import("../config/settings_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -449,16 +450,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",     "auto_upgrade",           "cache_warming",
-    "collapse_tool_calls",      "context",                "effort",
-    "fast_mode",                "first_call_tool_choice", "max_agent_steps",
-    "max_tool_result_bytes",    "permission_mode",        "prompt_history.enabled",
-    "provider",                 "provider_order",         "provider_strict",
-    "review_model",             "session_titles",         "slash_menu_categories",
-    "sound.attention_required", "sound.max",              "sound.turn_end",
-    "startup_scrollback",       "status_line.context",    "status_line.session",
-    "status_line.workspace",    "theme",                  "ultrafast_mode",
-    "update_channel",
+    "auto_compact_percent",  "auto_upgrade",             "cache_warming",
+    "collapse_tool_calls",   "context",                  "effort",
+    "fast_mode",             "first_call_tool_choice",   "max_agent_steps",
+    "max_tool_result_bytes", "permission_mode",          "prompt_history.enabled",
+    "project_config",        "provider",                 "provider_order",
+    "provider_strict",       "review_model",             "session_titles",
+    "slash_menu_categories", "sound.attention_required", "sound.max",
+    "sound.turn_end",        "startup_scrollback",       "status_line.context",
+    "status_line.session",   "status_line.workspace",    "theme",
+    "ultrafast_mode",        "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -486,6 +487,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "auto_upgrade")) return boolean(state.auto_upgrade);
     if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
+    if (eql(u8, key, "project_config")) return boolean(project_setting.allowed());
     if (eql(u8, key, "effort")) return string(state.effort.label());
     if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
     if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());

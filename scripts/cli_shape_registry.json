@@ -85,6 +85,10 @@
       "job": "setting-override",
       "stability": "stable"
     },
+    "FX_PROJECT_CONFIG": {
+      "job": "setting-override",
+      "stability": "stable"
+    },
     "FX_PROVIDER": {
       "job": "setting-override",
       "stability": "stable"

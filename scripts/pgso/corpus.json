@@ -125,6 +125,7 @@
     {"name": "verify-tui-usage", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-usage.test.ts"], "test_file": "tui-usage.test.ts"},
     {"name": "verify-tui-decision-prompts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-decision-prompts.test.ts"], "test_file": "tui-decision-prompts.test.ts"},
     {"name": "verify-poisoned-repository", "argv": ["bun", "test", "--max-concurrency", "1", "./poisoned-repository.test.ts"], "test_file": "poisoned-repository.test.ts"},
+    {"name": "verify-project-config", "argv": ["bun", "test", "--max-concurrency", "1", "./project-config.test.ts"], "test_file": "project-config.test.ts", "requires_tmux": false},
     {"name": "verify-tui-file-picker", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-file-picker.test.ts"], "test_file": "tui-file-picker.test.ts"},
     {"name": "verify-tui-host-instances", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-instances.test.ts"], "test_file": "tui-host-instances.test.ts"},
     {"name": "verify-tui-input-line-delete", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-line-delete.test.ts"], "test_file": "tui-input-line-delete.test.ts"},

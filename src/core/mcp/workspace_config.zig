@@ -2,6 +2,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const project_config = @import("project_config.zig");
+const project_setting = @import("../config/project_config_setting.zig");
 
 const max_config_bytes: usize = 1024 * 1024;
 
@@ -9,8 +10,15 @@ const max_config_bytes: usize = 1024 * 1024;
 /// through a symlink or a hard link, so a FIFO or a device in a cloned repo
 /// can't block the read. Null when there is none, and
 /// `error.UnreadableConfig` when it exists but fx won't read it. Caller owns
-/// the bytes.
+/// the bytes. Null too when the host turned the repository's configuration
+/// off (`project_config`), so its servers are never offered or started.
 pub fn readFile(alloc: std.mem.Allocator, workspace_root: []const u8) !?[]u8 {
+    return readFileFor(alloc, workspace_root, project_setting.allowed());
+}
+
+/// `readFile` with the host's decision given: null whenever `use_project` is false.
+pub fn readFileFor(alloc: std.mem.Allocator, workspace_root: []const u8, use_project: bool) !?[]u8 {
+    if (!use_project) return null;
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return null,
         else => return err,
@@ -69,4 +77,20 @@ fn invalidResult(alloc: std.mem.Allocator) !project_config.WorkspaceParseResult 
     errdefer result.deinit(alloc);
     try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
     return result;
+}
+
+test "a workspace's .mcp.json is not read when the host turns project_config off" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io_mod.getIo(), ".mcp.json", .{});
+    try file.writeStreamingAll(io_mod.getIo(), "{\"mcpServers\":{\"planted\":{\"command\":\"/bin/true\"}}}");
+    file.close(io_mod.getIo());
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    const read = (try readFileFor(alloc, root, true)).?;
+    defer alloc.free(read);
+    try std.testing.expect(std.mem.find(u8, read, "planted") != null);
+    try std.testing.expect((try readFileFor(alloc, root, false)) == null);
 }

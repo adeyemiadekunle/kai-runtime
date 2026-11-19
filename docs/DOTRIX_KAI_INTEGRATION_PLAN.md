@@ -28,6 +28,8 @@ Each item says what already exists, what changes, and the evidence that closes i
 
 ### D1. Host-owned configuration for Codes (security, first)
 
+**Status: done in the fork and wired in Dotrix, verified locally on Linux x64.** The profile-only setting `project_config` (default on) and its override `FX_PROJECT_CONFIG` (`src/core/config/project_config_setting.zig`) gate the repository's `.fx.json` settings layer, `.fx/agents` profile root, workspace skill roots, `.mcp.json`, and project instructions, including subdirectory `AGENTS.md` notes. A repository cannot set it. Before the change, a probe through Dotrix's own cloud driver (`infra/coding/fx-acp.mjs`) with this fork binary showed a repository's `AGENTS.md` and skill reaching the model; with the setting off, neither did. Tests: `tests/e2e/project-config.test.ts`, Zig tests in `profiles.zig` and `mcp/workspace_config.zig`, and Dotrix's driver and local-profile tests. The repository's files stay readable through the agent's tools as data.
+
 **Gap.** Dotrix's cloud ACP driver (`infra/coding/fx-acp.mjs`) writes `~/.fx/settings.json` with only provider and housekeeping keys. It does not set `context: false`, and nothing stops the repository's `.fx/agents/main/` profile, `.fx/skills/`, or `AGENTS.md` from reaching Kai's prompt. The native local profile sets `context: false`, but `context` is a `project_safe` key, so a repository's settings layer may turn it back on. Verify that precedence before relying on either.
 
 **Change in the fork.** One host control that, when set, makes the session ignore every repository-supplied configuration source: project settings, project profiles, project skills, project MCP configuration, and project instructions. Resolve profiles and skills only from roots the host names. Expose it through both ACP (Codes) and the SDK (Chat), with a name chosen through the `fx-cli-shape` skill. The repository's files remain readable as workspace data through the normal tools.
@@ -87,7 +89,7 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | Step | Repository | Items | Exit evidence |
 | --- | --- | --- | --- |
 | 1 | Fork | G1 fix | Zig and SDK tests; the Dotrix harness passes in every direction. Done in this branch, pending CI. |
-| 2 | Fork | D1 | ACP and SDK tests for ignored repository configuration |
+| 2 | Fork, then Dotrix | D1 (done) | ACP probe through the Dotrix driver, e2e and unit tests |
 | 3 | Fork | D4 limits audit and any missing host-set limits | ACP child tests |
 | 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact |
 | 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary |
