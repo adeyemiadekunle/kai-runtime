@@ -27,7 +27,7 @@ Toolchain: Zig 0.17.0 (the workflows' pin), Bun 1.4.4 and Node 22.23.5 (the work
 | SDK (Bun) | N-API lane, durable and core suites, journal, tool contract, host tools, cancellation, MCP and skills adapters (native) | Passed |
 | Shellcheck | `bash -n` and `shellcheck` on the listed scripts | Passed |
 | E2E | The whole deterministic corpus through `ci-run-files.sh`, in two local shards | 82 files: 73 passed, 4 passed only on retry (`mcp-http`, `mcp-verbs`, `tui-composer-edit-contracts`, `tui-resize`, which CI reports as warnings), 5 failed; see below |
-| TLA+ MCP, transcript window, subagent | As in the workflow | Running in the `ac077e2f` pass below |
+| TLA+ MCP, transcript window, subagent | As in the workflow | Passed in the `ac077e2f` pass below (no change to these models between the two commits) |
 
 The four unit-test failures are `core.cli.doctor_probes` (a child killed with its group at the deadline), `core.execution.command_runner` (a timeout terminates the foreground process group's descendants), and two `mcp.io.process` tests (stopping or deinitializing a server signals its whole process group). All four signal a process group. They failed the same way, as root, on the earlier commit `5cb37e3a`, which has neither this change nor any change to those modules. They fail in this container because its PID 1 (`process_api`) doesn't reap orphaned processes: a process a group stop killed stays a zombie that still answers `kill(pid, 0)`, so the test sees it running. A direct check showed an orphaned, killed grandchild left in state `Z`, and gone when run under `tini -s`, which reaps like a normal init. Hosted runners reap orphans. The E2E terminal-tool failures have the same cause. Re-running these tests under `tini -s` is pending.
 
@@ -53,12 +53,17 @@ Not run locally: the Windows desktop build and the release workflows.
 
 ## kai-runtime `ac077e2f` (`max_subagents`) and `3a997576` (changelog)
 
-Pushed while this pass was running, at the session's request. Run as before, plus a reaping init (`tini -s`) for the unit suite and Bun 1.4.2. `3a997576` changes only `CHANGELOG.md` and `AGENTS.md`.
+Pushed while this pass was running, at the session's request; every step then passed. Run as before, plus a reaping init (`tini -s`) for the unit suite and Bun 1.4.2. `3a997576` changes only `CHANGELOG.md` and `AGENTS.md`.
 
 | Step | Result |
 | --- | --- |
 | Format, CLI shape, PGSO corpus, public surface, boundaries | Passed |
-| Unit tests, build, smoke, TLA+ subagent, MCP and transcript window, E2E for ACP, project config, config persistence, MCP verbs, CLI, doctor, toolbox, sessions, TUI agents, session recovery | Running when pushed; results follow in the next update |
+| Unit tests (`zig build test -Doptimize=ReleaseSafe` under `tini -s`) | Passed, with no failures: the four process-group tests that fail without a reaping init pass |
+| Build (`-Dcpu=baseline`), `scripts/smoke-binary.sh` | Passed |
+| TLA+ subagent (stop-message, steer-queue, main-mail, quiet-relay, session write and live models, and their drivers) | Passed |
+| TLA+ MCP (model, MCP host, drivers) | Passed |
+| TLA+ transcript window (`--ci`) | Passed |
+| E2E: `acp`, `project-config`, `config-persistence`, `mcp-verbs`, `cli`, `doctor`, `toolbox`, `sessions`, `tui-agent`, `session-recovery` | Passed with no retries; `tui-agent` ran no tests here |
 
-The new `max_subagents` unit test and the settings-list tests passed in a run as root at `ac077e2f` before this pass.
+The new `max_subagents` unit test and the settings-list tests are in the unit suite above.
 
