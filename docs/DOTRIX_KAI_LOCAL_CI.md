@@ -93,3 +93,15 @@ Hosted CI still has to run the macOS and arm64 addons (`test:node-napi` on each)
 | Dotrix's real-binary tests with it as `fx` (`apps/cli/tests/test_real_local_engines.py`, `test_fx_native.py`: native namespace, protocol, resume, Stop, browser) | 18 passed, 10 skipped (Codex and desktop cases), the same as the earlier glibc build |
 | Dotrix [#281](https://github.com/adeyemiadekunle/dotrix/pull/281), Chat on `@kunemi-group/kai@0.0.17-kai.1`: full `uv run pytest` | 1,645 passed, 146 skipped |
 | Its fx Chat suites, the handoff test, and 0.0.16 → Kai cross-version (4) and restart (5) checks | 160 passed, 2 skipped (paid live-model tests); all passed |
+
+## Dotrix #282: Codes on `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1`
+
+| Step | Result |
+| --- | --- |
+| Published `@kunemi-group/kai-cli-linux-x64` and `-arm64` from `8935660b`; registry archives byte-identical to those built | Passed |
+| The coding image's install step, run with `sh` outside Docker against the registry: SHA-256 checked, `fx --version` | Passed; a wrong SHA-256 stops it |
+| Dotrix's cloud driver on a hostile repository: Kai's fx makes one model request with no repository instructions or skill; upstream fx 0.0.17 is refused before any request | Passed |
+| Dotrix's real-binary local tests with Kai's static fx | 27 passed, 10 skipped; upstream fx refused in every native case |
+| Dotrix's coding and CLI suites | 264 passed, 24 skipped |
+
+Not run: `docker build` of the coding image (no Docker daemon here), and the arm64 binary.

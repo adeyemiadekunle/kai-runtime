@@ -25,6 +25,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 ### Tests and docs
 
+- Dotrix runs these packages: Chat on `@kunemi-group/kai@0.0.17-kai.1` (dotrix#281) and Codes on `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1` (dotrix#282). Dotrix tells this fx from upstream's by `fx config get project_config`, since both report 0.0.17.
 - `test-node-package.mjs` checks the private scope's names, aliases, registry, and commit.
 - E2E: `project-config.test.ts`; journal tests for cut-off turns; released 0.0.16 and 0.0.17 journal fixtures; Zig tests for the new saved-format versions, the gated loaders, and `max_subagents`.
 - Docs: the Dotrix migration plan, Phase 1 compatibility results, the integration plan, and the local CI record kept while GitHub Actions is unavailable. `.gitignore` covers Python `__pycache__`.

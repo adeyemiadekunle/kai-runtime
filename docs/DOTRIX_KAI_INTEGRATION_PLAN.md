@@ -113,7 +113,7 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | 2 | Fork, then Dotrix | D1 (done) | ACP probe through the Dotrix driver, e2e and unit tests |
 | 3 | Fork, then Dotrix | D4 audit (done), `max_subagents`, worker activity in Codes | `tool_host.zig` tests; Dotrix driver test; probes through the Dotrix driver |
 | 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact. Done: Dotrix #281 pins `@kunemi-group/kai@0.0.17-kai.1`. |
-| 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary |
+| 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary. The binary part is done: Dotrix #282 installs `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1` in the coding image, pinned by SHA-256, and refuses an fx without `project_config` (upstream 0.0.17 reports the same version). D2 profiles and their digest are next. |
 | 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children |
 | 7 | Both | D7 recovery fixtures, Phase 2 provider checks | Cross-version and provider matrices |
 | 8 | Both | Retire legacy engines, then branding | Per the [migration plan](DOTRIX_KAI_MIGRATION_PLAN.md) |
