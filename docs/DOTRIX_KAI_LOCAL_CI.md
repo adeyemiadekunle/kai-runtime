@@ -1,6 +1,6 @@
 # Local CI while GitHub Actions is unavailable
 
-GitHub Actions can't run for this fork or for Dotrix until the account has credit again. Until then, each push is checked first by running the CI jobs locally, and the results are recorded here per commit. This doesn't replace hosted CI: macOS, Linux arm64, and the jobs that need artifacts from every platform still need it, and hosted CI should run on these commits once it is available. **R7.3, R7.5, R7.6.**
+GitHub Actions couldn't run for this fork while it was private, since private repositories use the account's paid minutes and none were left; Dotrix, which is public, ran again first. This repository was made public on 2026-11-19, so hosted CI should run on its pull requests and on `main` again, and later commits are checked there. Until then, each push was checked first by running the CI jobs locally, and the results are recorded here per commit. This doesn't replace hosted CI: macOS, Linux arm64, and the jobs that need artifacts from every platform still need it, and hosted CI should run on these commits once it is available. **R7.3, R7.5, R7.6.**
 
 ## How the jobs were run
 
