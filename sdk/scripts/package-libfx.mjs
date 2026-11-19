@@ -7,6 +7,13 @@
 // With no addons, it packages zig-out/lib/libfx.node for this machine. A
 // publishable set names one addon for every supported platform. LIBFX_VERSION
 // sets the version of every package and of libfx's optional dependencies.
+//
+// A private build sets LIBFX_SCOPE (such as @kunemi-group, for GitHub
+// Packages), LIBFX_NAME (such as kai) and LIBFX_REGISTRY: libfx is published
+// as <scope>/<name> and each platform's package as <scope>/<name>-<platform>.
+// libfx lists each platform's package as an npm alias under its usual
+// @libfx/ name, which node.js loads, so no import changes. LIBFX_SOURCE_COMMIT
+// records the commit the packages were built from.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -89,6 +96,18 @@ if (requestedNativeAddons.length) {
 
 const sourceManifest = JSON.parse(await readFile(resolve(repoRoot, "sdk/package.json"), "utf8"));
 const version = process.env.LIBFX_VERSION || sourceManifest.version;
+const scope = process.env.LIBFX_SCOPE || null;
+if (scope && !/^@[a-z0-9][a-z0-9-]*$/.test(scope)) throw new Error(`LIBFX_SCOPE must look like @owner: ${scope}`);
+const packageName = process.env.LIBFX_NAME || "libfx";
+if (!/^[a-z0-9][a-z0-9-]*$/.test(packageName)) throw new Error(`LIBFX_NAME must be a plain package name: ${packageName}`);
+if (packageName !== "libfx" && !scope) throw new Error("LIBFX_NAME needs LIBFX_SCOPE");
+const registry = process.env.LIBFX_REGISTRY || null;
+const sourceCommit = process.env.LIBFX_SOURCE_COMMIT || null;
+if (sourceCommit && !/^[0-9a-f]{40}$/.test(sourceCommit)) throw new Error("LIBFX_SOURCE_COMMIT must be a full commit SHA");
+// The name a package is published under: in the private scope, or its own.
+const published = (name) => (scope ? `${scope}/${name.replace(/^@[^/]+\//, "").replace(/^libfx/, packageName)}` : name);
+const publishConfig = registry ? { ...sourceManifest.publishConfig, registry } : sourceManifest.publishConfig;
+const provenance = sourceCommit ? { gitHead: sourceCommit } : {};
 
 await rm(outputDir, { recursive: true, force: true });
 for (const { name } of Object.values(nativeTargets)) {
@@ -112,11 +131,16 @@ if (bundle.error) throw bundle.error;
 if (bundle.status !== 0) process.exit(bundle.status ?? 1);
 
 const manifest = JSON.parse(await readFile(resolve(outputDir, "package.json"), "utf8"));
+manifest.name = published(manifest.name);
 manifest.version = version;
 manifest.files = undefined;
+if (registry) manifest.publishConfig = publishConfig;
+Object.assign(manifest, provenance);
 // Every platform's package at exactly this version; npm installs the one
-// whose os, cpu, and libc match the machine.
-manifest.optionalDependencies = Object.fromEntries(Object.values(nativeTargets).map(({ name }) => [name, version]));
+// whose os, cpu, and libc match the machine. A private build aliases each to
+// the name node.js loads.
+manifest.optionalDependencies = Object.fromEntries(Object.values(nativeTargets).map(({ name }) =>
+  [name, scope ? `npm:${published(name)}@${version}` : version]));
 await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
 const nativeDirs = [];
@@ -134,7 +158,7 @@ for (const { path, platform } of nativeAddons) {
   ].join("\n"));
   await writeFile(resolve(dir, "README.md"), `# ${name}\n\nThe libfx native addon for ${label}. libfx installs it for you, so install [libfx](https://www.npmjs.com/package/libfx) instead of this package.\n\nFor requirements and what to do when it's missing, see [libfx on Node.js](https://fx.sh/docs/lib/node).\n`);
   await writeFile(resolve(dir, "package.json"), `${JSON.stringify({
-    name,
+    name: published(name),
     version,
     description: `The libfx native addon for ${label}`,
     type: "module",
@@ -147,8 +171,9 @@ for (const { path, platform } of nativeAddons) {
     exports: { ".": "./index.js", "./package.json": "./package.json" },
     sideEffects: false,
     engines: sourceManifest.engines,
-    publishConfig: sourceManifest.publishConfig,
+    publishConfig,
     license: sourceManifest.license,
+    ...provenance,
   }, null, 2)}\n`);
   nativeDirs.push(dir);
 }

@@ -67,3 +67,18 @@ Pushed while this pass was running, at the session's request; every step then pa
 
 The new `max_subagents` unit test and the settings-list tests are in the unit suite above.
 
+## kai-runtime `925598b4` (private packaging) and `@kunemi-group/kai@0.0.17-kai.1`
+
+Changes only workflows, the packager, its test, a new script, and the changelog.
+
+| Step | Result |
+| --- | --- |
+| `node sdk/tests/test-node-package.mjs` (adds the private scope's names, aliases, registry, commit, and refusals) | Passed |
+| `shellcheck` and `bash -n` on `scripts/package-private-libfx.sh`; the workflows parse as YAML | Passed |
+| Addons for linux-x64 and linux-arm64 (glibc 2.34, baseline CPU), darwin-x64 and darwin-arm64, cross-compiled here with Zig 0.17.0 from `925598b4`'s source; both Linux addons pass `check-linux-abi.py` | Built; the macOS and arm64 addons weren't run, since there's no such machine here |
+| WASM core and term surfaces, ReleaseSmall | Built (not shrunk with `wasm-opt`) |
+| `scripts/package-private-libfx.sh` from the clean commit: pack, check, install as `libfx` with this machine's platform package, load the native backend | Passed |
+| Published to GitHub Packages: `@kunemi-group/kai` and its four platform packages at `0.0.17-kai.1`, `gitHead` `925598b4` | Published |
+| Installed from the registry as `"libfx": "npm:@kunemi-group/kai@0.0.17-kai.1"`: the alias pulls in only the linux-x64 package, and the native backend loads; three archives downloaded from the registry are byte-identical to those built here | Passed |
+
+Hosted CI still has to run the macOS and arm64 addons (`test:node-napi` on each) before Dotrix is deployed on those machines. Dotrix's Chat host runs on Linux x64.

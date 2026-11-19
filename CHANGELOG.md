@@ -17,8 +17,14 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 - `project_config` (profile-only, on by default) and `FX_PROJECT_CONFIG` let a host stop fx taking configuration from the repository it works in: its `.fx.json` settings, `.fx/agents` profiles, skill folders, `.mcp.json` servers, and project instructions such as `AGENTS.md`, subfolder ones included. A repository can't turn it back on. Its files stay readable through the agent's tools as data. Dotrix's coding sandbox sets it, since a probe showed a repository's `AGENTS.md` and skills reaching the model there.
 
+### Packaging
+
+- libfx is published privately to GitHub Packages as `@kunemi-group/kai`, in the kunemi-group organisation, with one `@kunemi-group/kai-<platform>` package per platform, by the manual workflow `publish-private-libfx.yml` or `scripts/package-private-libfx.sh` run locally. Versions follow the fx release they build on, as `0.0.17-kai.<n>`. libfx lists each platform package as an npm alias under its usual `@libfx/` name, so `node.js` loads it unchanged; each package records the commit it was built from, and a version already published is never replaced. `package-libfx.mjs` takes this as `LIBFX_SCOPE`, `LIBFX_NAME`, `LIBFX_REGISTRY`, and `LIBFX_SOURCE_COMMIT`; the workflow publishes with the `KAI_PACKAGES_TOKEN` secret. `0.0.17-kai.1` is published, from commit `925598b4`.
+- The upstream publishing workflows (release, dev release, libfx to npm, CDN backfill) run only in `vercel-labs/fx`, so the fork never publishes under fx's names.
+
 ### Tests and docs
 
+- `test-node-package.mjs` checks the private scope's names, aliases, registry, and commit.
 - E2E: `project-config.test.ts`; journal tests for cut-off turns; released 0.0.16 and 0.0.17 journal fixtures; Zig tests for the new saved-format versions, the gated loaders, and `max_subagents`.
 - Docs: the Dotrix migration plan, Phase 1 compatibility results, the integration plan, and the local CI record kept while GitHub Actions is unavailable. `.gitignore` covers Python `__pycache__`.
 

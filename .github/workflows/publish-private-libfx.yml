@@ -1,0 +1,137 @@
+name: Publish private libfx
+
+# The Kai runtime's libfx, published to GitHub Packages as @kunemi-group/kai
+# and one @kunemi-group/kai-<platform> package per platform. The repository's
+# GITHUB_TOKEN can't publish to the kunemi-group organisation, so the
+# KAI_PACKAGES_TOKEN secret holds a token with write:packages there. Dotrix's Chat host installs it from there. Started by hand, from a
+# commit on main, with a version such as 0.0.17-kai.1; a version already
+# published is never replaced. scripts/package-private-libfx.sh does the
+# packing, checks and publishing, so it can also be run locally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version, such as 0.0.17-kai.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-private-libfx
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: github.repository == 'adeyemiadekunle/kai-runtime'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.metadata.outputs.sha }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+      - name: Check the version
+        id: metadata
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          BASE_VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if ! [[ "$VERSION" =~ ^${BASE_VERSION//./\\.}-kai\.[0-9]+$ ]]; then
+            echo "::error::version must be ${BASE_VERSION}-kai.<n>, not ${VERSION}"
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  native:
+    needs: metadata
+    name: Native (${{ matrix.package_platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            package_platform: linux-x64
+            target_flags: -Dtarget=x86_64-linux-gnu.2.34 -Dcpu=baseline
+          - runner: ubuntu-24.04-arm
+            package_platform: linux-arm64
+            target_flags: -Dtarget=aarch64-linux-gnu.2.34 -Dcpu=baseline
+          - runner: macos-15-intel
+            package_platform: darwin-x64
+          - runner: macos-15
+            package_platform: darwin-arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.0"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+      - name: Build ReleaseSafe addon
+        run: zig build libfx-napi -Dnapi-surface=core -Doptimize=ReleaseSafe -Dupdate-channel=stable ${{ matrix.target_flags }}
+      - name: Check Linux ABI baseline
+        if: startsWith(matrix.package_platform, 'linux-')
+        run: python3 sdk/scripts/check-linux-abi.py zig-out/lib/libfx.node
+      - name: Test native addon
+        run: npm run --prefix sdk test:node-napi
+      - name: Name the addon for packaging
+        run: |
+          mkdir -p native-addons
+          cp zig-out/lib/libfx.node native-addons/libfx.${{ matrix.package_platform }}.node
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-native-${{ matrix.package_platform }}
+          path: native-addons/libfx.${{ matrix.package_platform }}.node
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.0"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.18.0"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: libfx-native-*
+          path: native-addons
+          merge-multiple: true
+      - name: Build WebAssembly surfaces
+        run: |
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall -Dupdate-channel=stable
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall -Dupdate-channel=stable
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
+      - name: Install the durable Worlds
+        run: npm ci --prefix sdk/durable
+      - name: Pack, check, and publish
+        env:
+          LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
+          LIBFX_SOURCE_COMMIT: ${{ needs.metadata.outputs.sha }}
+          NODE_AUTH_TOKEN: ${{ secrets.KAI_PACKAGES_TOKEN }}
+        run: scripts/package-private-libfx.sh native-addons out --publish
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libfx-private-packages
+          path: |
+            out/*.tgz
+            out/native/*.tgz
+            out/packages.sha256
+          if-no-files-found: error

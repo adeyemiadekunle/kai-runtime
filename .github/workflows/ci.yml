@@ -1012,6 +1012,7 @@ jobs:
             scripts/check-recovery-boundary.sh
             scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
+            scripts/package-private-libfx.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
           )

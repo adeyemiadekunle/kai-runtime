@@ -25,6 +25,8 @@ env:
 
 jobs:
   backfill:
+    # Upstream's publishing: the Kai runtime fork publishes through publish-private-libfx.yml instead.
+    if: github.repository == 'vercel-labs/fx'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
