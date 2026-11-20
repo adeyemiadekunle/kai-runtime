@@ -97,6 +97,21 @@ Dotrix's driver asks each session for hook events with `captureContent`, maps a 
 
 **Change.** None until a Dotrix consumer needs a field it can't get. Candidates: a stable sequence per execution for replay, and `max_output_tokens` and other stop reasons surfaced to the UI. Do not add the envelope proposed in the direction document wholesale.
 
+**Added for a consumer (0.0.17-kai.3).** Dotrix's Codes lists Kai's background tasks, the way Claude Code lists its own, and keeps commands running between turns. That needed two fields fx didn't give:
+
+- **`_meta.fx.shell`.** A `shell` call's final `tool_call_update` names a command fx keeps: `{sessionId, state[, exitCode]}`. On `session/load`, replayed updates carry it from the saved result, marked `historical: true`, since it's the state seen when the turn ran (#14).
+- **`fx/shells`.** An ACP request that lists the commands the process keeps: `{shells: [{sessionId, command, state, exitCode?, signal?, output, startedMs}]}`. `output` is the last 4 KiB a command printed, and finished commands fx still keeps are listed too. It answers during a prompt as well.
+  - Kept commands live as long as the `fx acp` process, across prompts. So a host that keeps the process running can say when one finishes.
+  - Working on it found a crash. A command that printed after its prompt returned made fx segfault, because its output callback still pointed at the prompt's stack context. Prompts now detach from their commands before returning.
+
+How Dotrix uses them (dotrix#294):
+
+- **The host.** `infra/coding/fx-host.mjs` keeps one `fx acp` per warm sandbox, detached from the turn, and each turn's `fx-acp.mjs` attaches to it over a Unix socket. A different model, provider, MCP servers or workers start a new fx. A driver that goes away mid-prompt has its prompt cancelled.
+- **Between turns.** The host polls `fx/shells` every 5 s and writes the result to `shells.json`. The worker reads it from each warm fx sandbox and records each change on the session's latest turn. The next turn continues the open session and tells Kai which commands finished.
+- **No turn starts on its own.** Codes shows when a command finishes, with its output.
+- **Lifetime.** A sandbox with a command running stays up past the idle time, for up to `DOTRIX_CODING_BACKGROUND_MINUTES` (6 hours) after its turn. However it is let go, its running commands are recorded as ended.
+- **Limits.** Sleeping sandboxes (Docker Cloud), fresh sandboxes and local turns don't keep commands. The host hasn't yet run in a rebuilt coding image.
+
 ### D7. Recovery and saved-state follow-ups
 
 - G1 (output-limit cutoff) is fixed in the fork: events and checkpoints that hold a cut-off answer are version 5, and a retried turn reports `max_output_tokens`.
@@ -120,6 +135,7 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary. Done: D2's profile and digest (above) and the binary part: Dotrix #282 installs `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1` in the coding image, pinned by SHA-256, and refuses an fx without `project_config` (upstream 0.0.17 reports the same version). |
 | 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children. Done: Dotrix #289 (explorer, tester, reviewer, pinned with the session, with step and token limits); the profile listing over ACP is in 0.0.17-kai.2. |
 | 7 | Both | D7 recovery fixtures, Phase 2 provider checks | Cross-version and provider matrices. D7 done: a session saved by 0.0.17-kai.1 resumes on the next build, and saved state the engine can't read starts a new conversation and says so (Dotrix #289). Gemini's tool calls work in 0.0.17-kai.2; paid provider checks remain. |
+| 7b | Both | Kai's background tasks in Codes (D6): `_meta.fx.shell`, `fx/shells`, the kept-command crash fix; the sandbox host | Done: 0.0.17-kai.3 (kai-runtime#14, released with #15) and dotrix#294, which pins it in the coding image. ACP tests for live, replayed and post-prompt commands; Dotrix's 46 fx coding tests on the published x64 binary. Not yet run in a rebuilt coding image or on a paid model. |
 | 8 | Both | Retire legacy engines, then branding | Per the [migration plan](DOTRIX_KAI_MIGRATION_PLAN.md) |
 
 ## Proposed `src/dotrix/` layout, reconsidered
