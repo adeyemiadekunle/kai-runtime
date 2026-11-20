@@ -66,6 +66,12 @@ pub const Profile = struct {
     mcp_servers: ?[]const []const u8 = null,
     prompt: []const u8 = "",
     prompt_mode: PromptMode = .append,
+    /// The most model steps a turn of an agent in this profile takes, below
+    /// its parent's limit; null keeps the parent's.
+    max_steps: ?usize = null,
+    /// The most tokens, input and output together, a turn of an agent in this
+    /// profile spends before it stops; null sets no limit of its own.
+    max_tokens: ?u64 = null,
     ignored: []const Ignored = &.{},
 };
 
@@ -240,6 +246,10 @@ pub fn parse(
             profile.tools = try nameList(arena, failure, name, key, value);
         } else if (std.mem.eql(u8, key, "mcp_servers")) {
             profile.mcp_servers = try nameList(arena, failure, name, key, value);
+        } else if (std.mem.eql(u8, key, "max_steps")) {
+            profile.max_steps = @intCast(try positiveField(arena, failure, name, key, value));
+        } else if (std.mem.eql(u8, key, "max_tokens")) {
+            profile.max_tokens = try positiveField(arena, failure, name, key, value);
         } else if (std.mem.eql(u8, key, "prompt")) {
             const raw = try stringField(arena, failure, name, key, value);
             profile.prompt_mode = std.meta.stringToEnum(PromptMode, raw) orelse
@@ -251,6 +261,15 @@ pub fn parse(
     if (profile.description.len == 0) return fail(arena, failure, "profile '{s}' needs a description", .{name});
     profile.ignored = ignored.items;
     return profile;
+}
+
+/// A positive whole number, for a limit. A limit can only lower what an agent
+/// may spend, so a repository's profile may set one too.
+fn positiveField(arena: Allocator, failure: *?[]const u8, name: []const u8, key: []const u8, value: std.json.Value) ParseError!u64 {
+    if (value != .integer or value.integer < 1 or value.integer > std.math.maxInt(u32)) {
+        return fail(arena, failure, "profile '{s}': {s} must be a whole number from 1 to {d}", .{ name, key, std.math.maxInt(u32) });
+    }
+    return @intCast(value.integer);
 }
 
 /// Whether `profile` lets an agent use `tool`. `*` covers every tool,
@@ -870,6 +889,35 @@ test "a profile without a description, with bad JSON, or with a bad value is ref
     }
     var failure: ?[]const u8 = null;
     try testing.expectError(error.InvalidProfile, parse(arena, "Bad Name", .home, "{\"description\": \"x\"}", "", &failure));
+}
+
+test "a profile's step and token limits parse, from the user's profile or a repository's" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]Source{ .home, .project }) |source| {
+        const limited = try testParse(arena, source,
+            \\{"description": "Bounded", "max_steps": 12, "max_tokens": 40000}
+        , "");
+        try testing.expectEqual(@as(usize, 12), limited.max_steps.?);
+        try testing.expectEqual(@as(u64, 40000), limited.max_tokens.?);
+        try testing.expectEqual(@as(usize, 0), limited.ignored.len);
+    }
+    const plain = try testParse(arena, .home,
+        \\{"description": "Plain"}
+    , "");
+    try testing.expect(plain.max_steps == null and plain.max_tokens == null);
+    for ([_][]const u8{
+        "{\"description\": \"x\", \"max_steps\": 0}",
+        "{\"description\": \"x\", \"max_steps\": -3}",
+        "{\"description\": \"x\", \"max_tokens\": \"many\"}",
+        "{\"description\": \"x\", \"max_tokens\": 1.5}",
+        "{\"description\": \"x\", \"max_tokens\": 99999999999}",
+    }) |json| {
+        var failure: ?[]const u8 = null;
+        try testing.expectError(error.InvalidProfile, parse(arena, "worker", .home, json, "", &failure));
+        try testing.expect(std.mem.find(u8, failure.?, "must be a whole number") != null);
+    }
 }
 
 test "fx's main and agent profiles decide nothing, so an agent in either copies its parent" {

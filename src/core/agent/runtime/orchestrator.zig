@@ -8020,6 +8020,26 @@ fn processQueuedPromptLoop(
     debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        // A turn past its token limit stops before another model call, as one
+        // past its step limit does.
+        if (step > 0 and config.agent_token_limit != 0 and
+            summary_accumulator.spent_tokens >= config.agent_token_limit)
+        {
+            debug_trace.logf("agent", "token limit reached step={d} limit={d}", .{ step, config.agent_token_limit });
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                config.token_limit_notice,
+                "token_limit",
+            );
+            return;
+        }
         // The notes the last step's gate queued follow that step's results and
         // come before any steering at this boundary (D93), including the
         // steering the last step ended with.

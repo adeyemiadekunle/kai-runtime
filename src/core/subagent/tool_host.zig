@@ -4546,6 +4546,8 @@ fn admissionFrom(
         else
             0,
         .mcp_view = snapshot.mcp_view,
+        .step_limit = snapshot.step_limit,
+        .token_limit = snapshot.token_limit,
     }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.AdmissionFailed,

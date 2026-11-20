@@ -21,6 +21,7 @@ pub const TurnOrigin = enum { root, subagent };
 
 pub const Config = struct {
     pub const default_step_limit_notice = "Agent step limit reached; continue with a follow-up prompt if needed.";
+    pub const default_token_limit_notice = "Agent token limit reached; continue with a follow-up prompt if needed.";
 
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
@@ -43,6 +44,11 @@ pub const Config = struct {
     },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,
+    /// The most tokens, input and output together, the turn spends before it
+    /// stops at the next step; 0 sets no limit. A subagent's comes from its
+    /// profile (`max_tokens`).
+    agent_token_limit: u64 = 0,
+    token_limit_notice: []const u8 = default_token_limit_notice,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     /// Share of the model's usable input at which automatic compaction starts.
     auto_compact_percent: u8 = compactor.default_percent,

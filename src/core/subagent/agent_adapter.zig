@@ -330,7 +330,8 @@ pub fn run(
             .advertised_functions = child_functions,
             .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
             .custom_tool_guidance = config.custom_tool_guidance,
-            .agent_step_limit = config.tool_context.agent_step_limit,
+            .agent_step_limit = childStepLimit(config.tool_context.agent_step_limit, admission.step_limit),
+            .agent_token_limit = admission.token_limit orelse 0,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
@@ -1151,4 +1152,19 @@ test "a profile that replaces the system prompt still leaves a child its role" {
     try std.testing.expect(std.mem.startsWith(u8, prompt, "Review only.\n\n<subagent_role>\n"));
     try std.testing.expect(std.mem.find(u8, prompt, "You are the subagent \"helper\", started by \"lead\".") != null);
     try std.testing.expect(std.mem.find(u8, prompt, "base prompt") == null);
+}
+
+/// A child's step limit: its parent's, lowered to its profile's own. 0 is no
+/// limit, so a profile's limit applies on its own there.
+fn childStepLimit(parent: usize, profile: ?usize) usize {
+    const own = profile orelse return parent;
+    return if (parent == 0) own else @min(parent, own);
+}
+
+test "a child's profile can only lower its parent's step limit" {
+    try std.testing.expectEqual(@as(usize, 25), childStepLimit(25, null));
+    try std.testing.expectEqual(@as(usize, 5), childStepLimit(25, 5));
+    try std.testing.expectEqual(@as(usize, 25), childStepLimit(25, 90));
+    try std.testing.expectEqual(@as(usize, 7), childStepLimit(0, 7));
+    try std.testing.expectEqual(@as(usize, 0), childStepLimit(0, null));
 }
