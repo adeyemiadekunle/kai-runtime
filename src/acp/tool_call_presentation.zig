@@ -120,6 +120,66 @@ const ShellResultView = struct {
 
 const shell_output_cut_marker = "... output truncated ...";
 
+/// The fields of a shell result that name a command fx keeps (one left running in
+/// the background, or polled or stopped later by its id).
+const ShellSessionView = struct {
+    session_id: ?[]const u8 = null,
+    state: []const u8,
+    exit_code: ?i64 = null,
+};
+
+/// `_meta` for a finished `shell` call's tool_call_update when its result names
+/// a kept command: `{"fx":{"shell":{"sessionId":…,"state":…[,"exitCode":…]}}}`,
+/// so a client can follow commands left running in the background (ACP's
+/// content carries only what they printed). Null for any other call or result.
+/// Caller owns the returned JSON.
+/// `historical`: replayed from a saved session (`session/load`): the state the
+/// command was last seen in when its turn ran, not its state now (`fx/shells`).
+pub fn shellSessionMeta(
+    alloc: Allocator,
+    tool_name: []const u8,
+    output: []const u8,
+    historical: bool,
+) Allocator.Error!?[]u8 {
+    if (!std.mem.eql(u8, tool_name, "shell")) return null;
+    const parsed = json_decode.parseFromSlice(
+        ShellSessionView,
+        alloc,
+        output,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    const session_id = parsed.value.session_id orelse return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    std.json.Stringify.value(.{ .fx = .{ .shell = .{
+        .sessionId = session_id,
+        .state = parsed.value.state,
+        .exitCode = parsed.value.exit_code,
+        .historical = if (historical) true else null,
+    } } }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+test "a shell result naming a kept command becomes its tool update's _meta" {
+    const alloc = std.testing.allocator;
+    const running = (try shellSessionMeta(alloc, "shell", "{\"session_id\":\"shell-1\",\"state\":\"running\",\"output_delta\":\"\"}", false)).?;
+    defer alloc.free(running);
+    try std.testing.expectEqualStrings("{\"fx\":{\"shell\":{\"sessionId\":\"shell-1\",\"state\":\"running\"}}}", running);
+    const done = (try shellSessionMeta(alloc, "shell", "{\"session_id\":\"shell-1\",\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"ok\"}", false)).?;
+    defer alloc.free(done);
+    try std.testing.expectEqualStrings("{\"fx\":{\"shell\":{\"sessionId\":\"shell-1\",\"state\":\"completed\",\"exitCode\":0}}}", done);
+    try std.testing.expect(try shellSessionMeta(alloc, "shell", "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"\"}", false) == null);
+    try std.testing.expect(try shellSessionMeta(alloc, "read_file", "{\"session_id\":\"x\",\"state\":\"running\"}", false) == null);
+    try std.testing.expect(try shellSessionMeta(alloc, "shell", "not json", false) == null);
+    const replayed = (try shellSessionMeta(alloc, "shell", "{\"session_id\":\"shell-1\",\"state\":\"running\",\"output_delta\":\"\"}", true)).?;
+    defer alloc.free(replayed);
+    try std.testing.expectEqualStrings("{\"fx\":{\"shell\":{\"sessionId\":\"shell-1\",\"state\":\"running\",\"historical\":true}}}", replayed);
+}
+
 /// Content for a finished `shell` call's tool_call_update, live or replayed.
 /// The model receives a JSON result, but the client is shown what the command
 /// printed: the snapshot fallback notice on its own line when the result

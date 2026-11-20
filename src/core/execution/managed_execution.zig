@@ -210,6 +210,21 @@ pub const ListItem = struct {
     }
 };
 
+pub const ReportItem = struct {
+    execution_id: []u8,
+    command: []u8,
+    state: SnapshotState,
+    output_tail: []u8,
+    started_ms: i64,
+
+    pub fn deinit(self: *ReportItem, alloc: Allocator) void {
+        alloc.free(self.execution_id);
+        alloc.free(self.command);
+        alloc.free(self.output_tail);
+        self.* = undefined;
+    }
+};
+
 const CapturedAuthority = struct {
     route: execution_router.PreparedCommandRoute,
 };
@@ -247,6 +262,10 @@ const Entry = struct {
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
+    /// Held while `on_output_chunk` runs and while its owner detaches it
+    /// (`Runtime.detachOutputChunks`), so a command that outlives the call
+    /// that started it never calls into that call's ended context.
+    chunk_mutex: std.Io.Mutex = .init,
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
@@ -503,6 +522,19 @@ const Entry = struct {
         try self.appendBoundedOutput(chunk);
     }
 
+    /// The command's live output to whoever started it, while they still
+    /// listen: a turn that ends detaches, and a command kept running after
+    /// it then goes on without streaming to it.
+    fn forwardOutputChunk(raw: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, stream: command_contract.CommandOutputStream, chunk: []const u8) !void {
+        const self: *Entry = @ptrCast(@alignCast(raw));
+        const zio = io_mod.getIo();
+        self.chunk_mutex.lockUncancelable(zio);
+        defer self.chunk_mutex.unlock(zio);
+        const callback = self.on_output_chunk orelse return;
+        const ctx = self.output_chunk_ctx orelse return;
+        return callback(ctx, lifecycle_id, stream, chunk);
+    }
+
     fn workerMain(self: *Entry) void {
         self.start_gate.waitUncancelable(io_mod.getIo());
         const captured = switch (self.backend_state) {
@@ -515,8 +547,8 @@ const Entry = struct {
             .cancel_flag = &self.cancel,
             .force_cancel_flag = &self.force_cancel,
             .output_chunk_lifecycle_id = self.output_chunk_lifecycle_id,
-            .output_chunk_ctx = self.output_chunk_ctx,
-            .on_output_chunk = self.on_output_chunk,
+            .output_chunk_ctx = self,
+            .on_output_chunk = if (self.on_output_chunk != null) forwardOutputChunk else null,
             .accepted_output_chunk_ctx = self,
             .on_accepted_output_chunk = appendOutput,
             .callback_projection = .raw,
@@ -1123,6 +1155,57 @@ pub const Runtime = struct {
                 .state = entry.statusSnapshot(),
                 .backend = entry.backend(),
                 .persistence = entry.persistence(),
+            });
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// `ctx` is ending (an ACP prompt's context): no command calls its output
+    /// callback from now on. A call already running finishes first.
+    pub fn detachOutputChunks(self: *Runtime, ctx: *anyopaque) void {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            if (entry.output_chunk_ctx != ctx) continue;
+            entry.chunk_mutex.lockUncancelable(zio);
+            entry.on_output_chunk = null;
+            entry.output_chunk_ctx = null;
+            entry.chunk_mutex.unlock(zio);
+        }
+    }
+
+    /// Every command this process keeps, finished ones it still holds
+    /// included, with the end of what each printed (at most
+    /// `tail_bytes`), for a host that shows them between turns (`fx/shells`).
+    pub fn report(self: *Runtime, alloc: Allocator, tail_bytes: usize) ![]ReportItem {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        var result: std.ArrayList(ReportItem) = .empty;
+        errdefer {
+            for (result.items) |*item| item.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            defer entry.mutex.unlock(zio);
+            if (entry.pending_delete) continue;
+            if (entry.backend() == .tty and entry.backend_state == .tombstone) continue;
+            const output = entry.output.items;
+            const tail = output[output.len - @min(output.len, tail_bytes) ..];
+            const execution_id = try alloc.dupe(u8, entry.execution_id);
+            errdefer alloc.free(execution_id);
+            const command = try alloc.dupe(u8, entry.command);
+            errdefer alloc.free(command);
+            try result.append(alloc, .{
+                .execution_id = execution_id,
+                .command = command,
+                .state = entry.statusSnapshot(),
+                .output_tail = try alloc.dupe(u8, tail),
+                .started_ms = entry.started_ms,
             });
         }
         return result.toOwnedSlice(alloc);
@@ -1910,6 +1993,69 @@ test "process-exit termination joins a command a cancelled foreground wait is al
     foreground.join();
     // Force escalation lands well inside the 800 ms cooperative grace.
     try std.testing.expect(elapsed_ms < 500);
+}
+
+test "a kept command stops streaming to a context that detached, and still records its output" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    const Counting = struct {
+        fn append(
+            raw: *anyopaque,
+            _: ?types.ToolLifecycleId,
+            _: command_contract.CommandOutputStream,
+            _: []const u8,
+        ) !void {
+            const count: *std.atomic.Value(u32) = @ptrCast(@alignCast(raw));
+            _ = count.fetchAdd(1, .seq_cst);
+        }
+    };
+    var chunks = std.atomic.Value(u32).init(0);
+    var input = StartCapturedInput{
+        .execution_id = "managed-detached-output",
+        .command = "printf 'one\\n'; sleep 0.4; printf 'two\\n'",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = null,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+        .output_chunk_ctx = &chunks,
+        .on_output_chunk = Counting.append,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    const first_deadline_ms = io_mod.milliTimestamp() + 2_000;
+    while (chunks.load(.seq_cst) == 0 and io_mod.milliTimestamp() < first_deadline_ms) io_mod.sleep(std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), chunks.load(.seq_cst));
+    // The call that started it ends: its context goes, and the command goes on.
+    runtime.detachOutputChunks(@ptrCast(&chunks));
+
+    const done_deadline_ms = io_mod.milliTimestamp() + 3_000;
+    var finished = false;
+    while (!finished and io_mod.milliTimestamp() < done_deadline_ms) {
+        const items = try runtime.report(alloc, 4096);
+        defer {
+            for (items) |*item| item.deinit(alloc);
+            alloc.free(items);
+        }
+        for (items) |item| {
+            if (!std.mem.eql(u8, item.execution_id, "managed-detached-output")) continue;
+            if (item.state == .completed) {
+                finished = true;
+                try std.testing.expect(std.mem.indexOf(u8, item.output_tail, "two") != null);
+            }
+        }
+        if (!finished) io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(u32, 1), chunks.load(.seq_cst));
 }
 
 test "captured stop returns lost when its worker cannot settle" {

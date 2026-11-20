@@ -1724,6 +1724,9 @@ const ReplayToolCall = struct {
     status: acp_types.ToolCallStatus,
     raw_input: ?std.json.Value,
     content_text: ?[]const u8,
+    /// `_meta.fx.shell` from the saved result, as the live update carried it,
+    /// marked historical.
+    shell_meta: ?[]const u8 = null,
 };
 
 const ReplayFrame = union(enum) {
@@ -1819,6 +1822,7 @@ fn planToolCallFrame(
                 tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
         else
             null else null,
+        .shell_meta = if (result) |r| try tool_call_presentation.shellSessionMeta(arena, call.name, r.output, true) else null,
     };
 }
 
@@ -1919,7 +1923,7 @@ fn sendHistoryToolCall(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeToolCallUpdate(&out.writer, call.id, call.status, call.content_text);
+    try acp_types.writeToolCallUpdateWithMeta(&out.writer, call.id, call.status, call.content_text, null, call.shell_meta);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }

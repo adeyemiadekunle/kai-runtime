@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
+const command_contract = @import("../core/execution/command_contract.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -91,6 +92,7 @@ const AcpMethod = enum {
     libfx_snapshot,
     libfx_journal_open,
     libfx_journal_images,
+    fx_shells,
     mcp_message,
     unknown,
 
@@ -117,6 +119,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
         if (std.mem.eql(u8, method, "libfx/journal_images")) return .libfx_journal_images;
+        if (std.mem.eql(u8, method, "fx/shells")) return .fx_shells;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
     }
@@ -136,6 +139,7 @@ const AcpMethod = enum {
             .libfx_withdraw,
             .libfx_handoff,
             .libfx_follow_up,
+            .fx_shells,
             => false,
             .session_list,
             .session_remove,
@@ -1530,6 +1534,8 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         return writePromptInProgress(state, alloc, msg.id);
     }
 
+    if (method == .fx_shells) return handleShells(state, alloc, msg);
+
     if (comptime host_target.is_wasm) {
         return switch (method) {
             .session_new => sessions.handleNewWasmSession(state, alloc, msg),
@@ -1579,6 +1585,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .request_cancel,
         .session_cancel,
         .session_remove,
+        .fx_shells,
         .mcp_message,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
@@ -1586,6 +1593,112 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .message = "Method not found",
         }),
     };
+}
+
+/// The end of each command's output `fx/shells` reports.
+const shells_tail_bytes: usize = 4096;
+
+/// `fx/shells`: the commands this process keeps running for its session (a
+/// shell `run` that outlived its call, or one steering sent to the
+/// background), finished ones it still keeps included. They live
+/// as long as this process, across prompts, so a host that keeps it running
+/// between turns can say when one finishes. Answered during a prompt too.
+fn handleShells(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const items = try state.managed_executions.report(alloc, shells_tail_bytes);
+    defer {
+        for (items) |*item| item.deinit(alloc);
+        alloc.free(items);
+    }
+    try state.writer.writeResponse(alloc, msg.id, try shellsJson(alloc, items));
+}
+
+const ShellReport = struct {
+    sessionId: []const u8,
+    command: []const u8,
+    state: []const u8,
+    exitCode: ?i64 = null,
+    signal: ?u32 = null,
+    output: []const u8,
+    startedMs: i64,
+};
+
+fn shellsJson(alloc: Allocator, items: []const managed_execution.ReportItem) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var reports: std.ArrayList(ShellReport) = .empty;
+    defer reports.deinit(alloc);
+    for (items) |item| {
+        var report: ShellReport = .{
+            .sessionId = item.execution_id,
+            .command = try validText(arena, item.command),
+            .state = @tagName(item.state),
+            .output = try validText(arena, item.output_tail),
+            .startedMs = item.started_ms,
+        };
+        const status: ?command_contract.CommandStatus = switch (item.state) {
+            .completed => |value| value,
+            .stopped => |value| value,
+            else => null,
+        };
+        if (status) |value| switch (value) {
+            .exit_code => |code| report.exitCode = code,
+            .signal => |sig| report.signal = sig,
+            else => {},
+        };
+        try reports.append(alloc, report);
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    std.json.Stringify.value(.{ .shells = reports.items }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+/// `text` as valid UTF-8 for JSON: a tail cut mid-character, or bytes that
+/// aren't text, become U+FFFD.
+fn validText(arena: Allocator, text: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    while (index < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[index]) catch 0;
+        if (len != 0 and index + len <= text.len and std.unicode.utf8ValidateSlice(text[index .. index + len])) {
+            try out.appendSlice(arena, text[index .. index + len]);
+            index += len;
+        } else {
+            try out.appendSlice(arena, "\u{FFFD}");
+            index += 1;
+        }
+    }
+    return out.items;
+}
+
+test "fx/shells reports each kept command with its state and exit" {
+    const alloc = std.testing.allocator;
+    var tail_running = "building...".*;
+    var tail_done = "ok\n".*;
+    var id1 = "shell-1".*;
+    var id2 = "shell-2".*;
+    var cmd1 = "make ci".*;
+    var cmd2 = "npm test".*;
+    const items = [_]managed_execution.ReportItem{
+        .{ .execution_id = &id1, .command = &cmd1, .state = .running, .output_tail = &tail_running, .started_ms = 5 },
+        .{ .execution_id = &id2, .command = &cmd2, .state = .{ .completed = .{ .exit_code = 1 } }, .output_tail = &tail_done, .started_ms = 7 },
+    };
+    const json = try shellsJson(alloc, &items);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"shells\":[{\"sessionId\":\"shell-1\",\"command\":\"make ci\",\"state\":\"running\",\"output\":\"building...\",\"startedMs\":5}," ++
+            "{\"sessionId\":\"shell-2\",\"command\":\"npm test\",\"state\":\"completed\",\"exitCode\":1,\"output\":\"ok\\n\",\"startedMs\":7}]}",
+        json,
+    );
+    var broken = "ok \xe2\x82".*;
+    const cut = [_]managed_execution.ReportItem{
+        .{ .execution_id = &id1, .command = &cmd1, .state = .lost, .output_tail = &broken, .started_ms = 1 },
+    };
+    const repaired = try shellsJson(alloc, &cut);
+    defer alloc.free(repaired);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(repaired));
 }
 
 fn requestIdsEqual(lhs: jsonrpc.RequestId, rhs: jsonrpc.RequestId) bool {

@@ -247,6 +247,19 @@ pub fn writeToolCallUpdateWithCommandResult(
     content_text: ?[]const u8,
     command_result_json: ?[]const u8,
 ) !void {
+    try writeToolCallUpdateWithMeta(w, tool_call_id, status, content_text, command_result_json, null);
+}
+
+/// `writeToolCallUpdateWithCommandResult` with the update's `_meta` (a JSON
+/// object, such as `tool_call_presentation.shellSessionMeta`'s), when not null.
+pub fn writeToolCallUpdateWithMeta(
+    w: *std.Io.Writer,
+    tool_call_id: []const u8,
+    status: ToolCallStatus,
+    content_text: ?[]const u8,
+    command_result_json: ?[]const u8,
+    meta_json: ?[]const u8,
+) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
     try w.writeAll(",\"status\":");
@@ -258,6 +271,10 @@ pub fn writeToolCallUpdateWithCommandResult(
     }
     if (command_result_json) |json| {
         try w.writeAll(",\"command_result\":");
+        try w.writeAll(json);
+    }
+    if (meta_json) |json| {
+        try w.writeAll(",\"_meta\":");
         try w.writeAll(json);
     }
     try w.writeAll("}");
