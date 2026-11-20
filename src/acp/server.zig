@@ -1600,7 +1600,7 @@ const shells_tail_bytes: usize = 4096;
 
 /// `fx/shells`: the commands this process keeps running for its session (a
 /// shell `run` that outlived its call, or one steering sent to the
-/// background), finished ones the model hasn't read yet included. They live
+/// background), finished ones it still keeps included. They live
 /// as long as this process, across prompts, so a host that keeps it running
 /// between turns can say when one finishes. Answered during a prompt too.
 fn handleShells(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {

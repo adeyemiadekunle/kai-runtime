@@ -1176,8 +1176,8 @@ pub const Runtime = struct {
         }
     }
 
-    /// Every command this process keeps, finished ones the model hasn't read
-    /// yet included, with the end of what each printed (at most
+    /// Every command this process keeps, finished ones it still holds
+    /// included, with the end of what each printed (at most
     /// `tail_bytes`), for a host that shows them between turns (`fx/shells`).
     pub fn report(self: *Runtime, alloc: Allocator, tail_bytes: usize) ![]ReportItem {
         const zio = io_mod.getIo();

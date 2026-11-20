@@ -2795,6 +2795,7 @@ fn completeToolCallTransport(
         ctx.alloc,
         call.name,
         result.model_output,
+        false,
     ) catch null;
     defer if (shell_meta) |json| ctx.alloc.free(json);
     const output_text = shell_text orelse toolUpdateContentText(result);

@@ -1176,6 +1176,87 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+test("ACP names a kept shell command in _meta.fx.shell, live and replayed as historical, and fx/shells lists it", async () => {
+  const fixture = createConfiguredProviderFixture(body => {
+    const step = body.messages.filter((message: any) => message.role === "tool").length;
+    if (step === 0) return configuredToolCompletion(body.model, "shell", { request: { action: "run", command: "sleep 1; echo KEPT", yield_time_ms: 0 } }, "call_start");
+    if (step === 1) return configuredToolCompletion(body.model, "shell", { request: { action: "interact", session_id: "shell-1", yield_time_ms: 5000 } }, "call_poll");
+    return configuredCompletion(body.model, "done");
+  });
+  const shellMeta = (lines: any[]) => lines
+    .filter((message: any) => message.method === "session/update" && ["call_start", "call_poll"].includes(message.params?.update?.toolCallId))
+    .map((message: any) => message.params.update)
+    .filter((update: any) => update.status === "completed" || update.status === "failed")
+    .map((update: any) => [update.toolCallId, update._meta?.fx?.shell]);
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Run it in the background, then check on it.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    expect(shellMeta(prompt.messages)).toEqual([
+      ["call_start", { sessionId: "shell-1", state: "running" }],
+      ["call_poll", { sessionId: "shell-1", state: "completed", exitCode: 0 }],
+    ]);
+    // fx keeps a finished command for a while: listed completed, with what's left to read (nothing: the model read it).
+    const shells = await client.request("fx/shells", {}, 9) as any;
+    expect(shells.result.shells).toEqual([
+      expect.objectContaining({ sessionId: "shell-1", command: "sleep 1; echo KEPT", state: "completed", exitCode: 0 }),
+    ]);
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    await client.close();
+
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (loaded.error) throw new Error(JSON.stringify(loaded));
+    // Replayed: what was seen when the turn ran, not the command's state now.
+    expect(shellMeta(client.rawLines.map(line => JSON.parse(line)))).toEqual([
+      ["call_start", { sessionId: "shell-1", state: "running", historical: true }],
+      ["call_poll", { sessionId: "shell-1", state: "completed", exitCode: 0, historical: true }],
+    ]);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
+test("ACP keeps a command running after its prompt, and fx/shells reports it finished", async () => {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", command: "sleep 1; echo AFTER", yield_time_ms: 0 } }, "call_kept"));
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Start it and finish.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    // The prompt has returned; the command prints after it (which crashed fx before its context was detached).
+    let found: any;
+    for (let id = 10, deadline = Date.now() + 10_000; Date.now() < deadline && found?.state !== "completed"; id++) {
+      const answer = await client.request("fx/shells", {}, id) as any;
+      found = answer.result?.shells?.find((shell: any) => shell.sessionId === "shell-1");
+      if (found?.state !== "completed") await Bun.sleep(100);
+    }
+    expect(found).toMatchObject({ command: "sleep 1; echo AFTER", state: "completed", exitCode: 0 });
+    expect(found.output).toContain("AFTER");
+    expect(client.stderr).toBe("");
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+  } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
 test("ACP lists the host's agent profiles in the subagent tool, and a repository's only when project_config allows", async () => {
   const root = createIsolatedRoot("fx-acp-profiles-");
   const hostProfile = join(root.home, ".fx", "agents", "explorer");
