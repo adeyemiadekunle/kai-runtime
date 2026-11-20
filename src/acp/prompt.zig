@@ -475,9 +475,13 @@ const AcpContext = struct {
     }
 
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        try self.sendToolCallCompletedWithMeta(tool_call_id, result_text, command_result_json, null);
+    }
+
+    fn sendToolCallCompletedWithMeta(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8, meta_json: ?[]const u8) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
+        try acp_types.writeToolCallUpdateWithMeta(&out.writer, tool_call_id, .completed, result_text, command_result_json, meta_json);
         try self.sendUpdate(out.writer.buffered());
         self.markCardFinished(tool_call_id);
     }
@@ -487,9 +491,13 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
+        try self.sendToolCallErrorWithMeta(tool_call_id, err_text, command_result_json, null);
+    }
+
+    fn sendToolCallErrorWithMeta(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8, meta_json: ?[]const u8) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
+        try acp_types.writeToolCallUpdateWithMeta(&out.writer, tool_call_id, .failed, err_text, command_result_json, meta_json);
         try self.sendUpdate(out.writer.buffered());
         self.markCardFinished(tool_call_id);
     }
@@ -2778,12 +2786,20 @@ fn completeToolCallTransport(
         result.model_output,
     ) catch null;
     defer if (shell_text) |text| ctx.alloc.free(text);
+    // A kept command (one left running in the background): its id and state, for the client to follow.
+    const shell_meta = tool_call_presentation.shellSessionMeta(
+        ctx.alloc,
+        call.name,
+        result.model_output,
+    ) catch null;
+    defer if (shell_meta) |json| ctx.alloc.free(json);
     const output_text = shell_text orelse toolUpdateContentText(result);
     if (result.status == .failure) {
-        ctx.sendToolCallErrorWithCommandResult(
+        ctx.sendToolCallErrorWithMeta(
             acp_id,
             output_text,
             result.command_result_json,
+            shell_meta,
         ) catch {};
         return result;
     }
@@ -2798,10 +2814,11 @@ fn completeToolCallTransport(
         };
         return deferred;
     }
-    ctx.sendToolCallCompletedWithCommandResult(
+    ctx.sendToolCallCompletedWithMeta(
         acp_id,
         output_text,
         result.command_result_json,
+        shell_meta,
     ) catch {};
     return result;
 }
