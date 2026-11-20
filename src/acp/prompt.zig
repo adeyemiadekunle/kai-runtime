@@ -1063,6 +1063,9 @@ pub fn handlePrompt(
         .current_prompt_input = &prompt_input,
     };
     defer ctx.deinitPublishedToolCalls();
+    // A command this prompt starts can outlive it (kept running); it stops
+    // streaming to this context, which is gone when the prompt returns.
+    defer state.managed_executions.detachOutputChunks(@ptrCast(&ctx));
 
     var hook_bridge: libfx_hooks.Bridge = undefined;
     if (session.observer_hooks) |hook_config| {
@@ -1428,6 +1431,7 @@ pub fn runSubagentChild(
         .captured_permission_mode = admission.permission_mode,
     };
     defer ctx.deinitPublishedToolCalls();
+    defer state.managed_executions.detachOutputChunks(@ptrCast(&ctx));
     var child_bridge: libfx_hooks.Bridge = undefined;
     if (active.observer_hooks) |hook_config| {
         child_bridge.init(alloc, &state.writer, turn.child_id orelse session_id, message.id, hook_config);
