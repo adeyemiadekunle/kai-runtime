@@ -199,6 +199,9 @@ pub const Snapshot = struct {
     permission_state: session_permission_state.State = .{},
     permission_mode: types.PermissionMode,
     mcp_view: ?mcp_access.View = null,
+    /// The child's profile's own limits on a turn (`profiles.Profile`).
+    step_limit: ?usize = null,
+    token_limit: ?u64 = null,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.child_id);
@@ -492,6 +495,8 @@ pub const Resolver = struct {
             .permission_state = permission_state,
             .permission_mode = current.permission_mode,
             .mcp_view = mcp_view,
+            .step_limit = if (current.profile) |profile| profile.max_steps else null,
+            .token_limit = if (current.profile) |profile| profile.max_tokens else null,
         };
     }
 };

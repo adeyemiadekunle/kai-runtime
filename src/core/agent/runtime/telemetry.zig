@@ -89,6 +89,11 @@ pub const TurnSummaryAccumulator = struct {
     thinking_duration_ms: u64 = 0,
     settled_token_progress: types.TurnTokenProgress = .{},
     active_token_request: ?ActiveTokenRequest = null,
+    /// Tokens the turn's model requests spent, input and output, as each
+    /// provider reported them (an estimate of the output where one reported
+    /// none), for a turn's token limit. Every request's input counts, since
+    /// each resends the conversation.
+    spent_tokens: u64 = 0,
 
     pub fn init(turn_started_at_ms: i64, submitted_prompt: []const u8) TurnSummaryAccumulator {
         var estimator = token_estimate.StreamingEstimator{};
@@ -142,6 +147,7 @@ pub const TurnSummaryAccumulator = struct {
         const active = self.active_token_request orelse return .invalid;
 
         const output_tokens = usage.output_tokens orelse active.outputEstimate();
+        self.spent_tokens +|= (usage.input_tokens orelse 0) +| output_tokens;
         self.settleOutputTokens(
             output_tokens,
             !delivery_ambiguous and usage.output_tokens != null,
@@ -155,6 +161,7 @@ pub const TurnSummaryAccumulator = struct {
         const active = self.active_token_request orelse return .unchanged;
         self.active_token_request = null;
         const output_tokens = active.outputEstimate();
+        self.spent_tokens +|= output_tokens;
         if (possibly_sent or output_tokens > 0) self.settleOutputTokens(output_tokens, false);
         return if (std.meta.eql(before, self.tokenProgress())) .unchanged else .changed;
     }
@@ -185,6 +192,19 @@ pub const TurnSummaryAccumulator = struct {
         };
     }
 };
+
+test "a turn's spent tokens count every request's input and output, estimated only where usage is missing" {
+    var summary = TurnSummaryAccumulator.init(0, "hi");
+    summary.prepareTokenRequest();
+    _ = summary.reconcileTokenRequest(.{ .input_tokens = 5000, .output_tokens = 10 }, false);
+    summary.prepareTokenRequest();
+    _ = summary.reconcileTokenRequest(.{ .input_tokens = 5100, .output_tokens = 20 }, false);
+    try std.testing.expectEqual(@as(u64, 10130), summary.spent_tokens);
+    summary.prepareTokenRequest();
+    _ = summary.consumeContent("an answer the provider gave no usage for");
+    _ = summary.finishTokenRequestWithoutUsage(true);
+    try std.testing.expect(summary.spent_tokens > 10130);
+}
 
 pub const StepLimitTrace = struct {
     ctx: TraceContext,

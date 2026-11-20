@@ -241,8 +241,8 @@ export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: F
 // ---------------------------------------------------------------------------
 // Turn events and results
 
-/** A model or tool event of a turn. */
-export type FxTurnEvent =
+/** A model or tool event of a turn. Each carries the `correlationId` its prompt gave, if any. */
+export type FxTurnEvent = { correlationId?: string } & (
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
   /** Steering entering the turn as its model request carries it; `id` is the steer's id. */
@@ -250,7 +250,8 @@ export type FxTurnEvent =
   | { type: "tool_start"; id: string; name: string; input?: JsonValue; inputTruncated?: undefined; inputPreview?: undefined }
   /** A tool input over 64 KiB of JSON arrives as a prefix. The tool still receives complete arguments. */
   | { type: "tool_start"; id: string; name: string; input?: undefined; inputTruncated: true; inputPreview: string }
-  | { type: "tool_end"; id: string; name: string; content?: string; isError: boolean };
+  | { type: "tool_end"; id: string; name: string; content?: string; isError: boolean }
+);
 
 /** Token usage. Each count is present when the provider reported it. */
 export interface FxUsage {
@@ -554,6 +555,8 @@ export interface FxEnginePromptOptions {
   signal?: AbortSignal;
   /** The turn's id, so a retried prompt continues or answers the same turn. 1 to 128 letters, digits, `.`, `_`, or `-`. */
   turnId?: string;
+  /** The host's own identifier for this turn (its run or task, say), 1 to 256 characters without control characters. Every event of the turn, the turn, and its result carry it as `correlationId`; without it they have none. */
+  correlationId?: string;
   onAmbiguous?: FxOnAmbiguous;
   /** With `persistence`: a time, in milliseconds since the epoch, after which the turn stops before its next model request with the stop reason `yielded`. The journal keeps it open, and the next `resume()` continues it without telling the model it was interrupted. */
   yieldAt?: number;
@@ -562,6 +565,8 @@ export interface FxEnginePromptOptions {
 /** Options for an engine's `resume()`. */
 export interface FxResumeOptions {
   signal?: AbortSignal;
+  /** As `FxEnginePromptOptions.correlationId`, for the resumed turn. */
+  correlationId?: string;
   onAmbiguous?: FxOnAmbiguous;
   /** As `FxEnginePromptOptions.yieldAt`. */
   yieldAt?: number;
@@ -571,6 +576,8 @@ export interface FxResumeOptions {
 export interface FxEngineTurnResult {
   stopReason: FxStopReason;
   usage: FxUsage;
+  /** The `correlationId` the turn's prompt gave, if any. */
+  correlationId?: string;
 }
 
 /** A steer: resolves to `{ id }` once accepted, and carries the same `id` at once. */
@@ -580,6 +587,8 @@ export type FxSteer = Promise<{ id: string; withdrawn?: true }> & { readonly id:
 export interface FxEngineTurn {
   /** The turn's id. */
   readonly id: string | null;
+  /** The `correlationId` the turn's prompt gave, if any. */
+  readonly correlationId?: string;
   readonly result: Promise<FxEngineTurnResult>;
   /** Stops the turn. `{ reason: "handoff" }` stores nothing more, so the next agent continues it; it needs persistence. */
   cancel(options?: { reason?: "handoff" }): void;

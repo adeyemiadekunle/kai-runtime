@@ -25,6 +25,7 @@ const js_host_steering = if (host_target.is_wasm)
 else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
+const profiles = @import("../core/profiles/profiles.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
@@ -1150,10 +1151,27 @@ pub fn handlePrompt(
         try v2.beginTurn();
     }
 
+    // The profiles a subagent can start in, listed in the subagent tool's guidance as `fx` lists them, from the
+    // roots a new child's profile loads from (`tool_host.loadChildProfile`), when a host or repository added one.
+    // Without the list, a host's profiles under ~/.fx/agents could be started by name but the model would never
+    // hear of them.
+    var profile_arena = std.heap.ArenaAllocator.init(alloc);
+    defer profile_arena.deinit();
+    const subagent_profiles: []const profiles.Entry = if (state.subagent_host != null) listed: {
+        const workspace_root = io_mod.realpathAlloc(profile_arena.allocator(), ".") catch null;
+        const roots = try profiles.Roots.init(profile_arena.allocator(), io_mod.homeDir(), workspace_root);
+        const listed = profiles.list(profile_arena.allocator(), roots) catch &.{};
+        // Only fx's own `main` and `agent`: nothing a host or repository added, so the request stays as before.
+        for (listed) |entry| {
+            if (entry.source != .builtin) break :listed listed;
+        }
+        break :listed &.{};
+    } else &.{};
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .subagent_profiles = subagent_profiles,
         .behind_toolbox = state.toolbox_behind.slice(),
     });
     defer tool_projection.deinit(alloc);

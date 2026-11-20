@@ -56,6 +56,10 @@ pub const AdmissionSnapshot = struct {
     integration_names: [][]u8,
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
+    /// The child's profile's limits on a turn: at most this many steps (below
+    /// its parent's limit) and tokens. Null sets none of its own.
+    step_limit: ?usize = null,
+    token_limit: ?u64 = null,
 
     /// An owned copy, made the way `captureAdmission` makes the original.
     pub fn clone(self: *const AdmissionSnapshot, alloc: Allocator) AdmissionError!AdmissionSnapshot {
@@ -74,6 +78,8 @@ pub const AdmissionSnapshot = struct {
             .integration_names = self.integration_names,
             .authority_generation = self.authority_generation,
             .mcp_view = self.mcp_view,
+            .step_limit = self.step_limit,
+            .token_limit = self.token_limit,
         });
     }
 
@@ -106,6 +112,8 @@ pub const AdmissionInput = struct {
     integration_names: []const []const u8 = &.{},
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
+    step_limit: ?usize = null,
+    token_limit: ?u64 = null,
 };
 
 pub const AdmissionError = error{
@@ -184,6 +192,8 @@ pub fn captureAdmission(
         .integration_names = integration_names,
         .authority_generation = input.authority_generation,
         .mcp_view = mcp_view,
+        .step_limit = input.step_limit,
+        .token_limit = input.token_limit,
     };
 }
 

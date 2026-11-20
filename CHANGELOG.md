@@ -6,10 +6,14 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 ### New Features
 
+- libfx: `prompt()` and `resume()` take a `correlationId`, the host's own identifier for the turn (its run or task, say). The turn, every one of its events, and its result carry it; a turn without one is unchanged. Bounded (1 to 256 characters, no control characters) and refused before the turn starts otherwise.
+- An agent profile can limit each turn of an agent started in it: `max_steps`, which lowers its parent's step limit, and `max_tokens`, counting every model request's input and output as the provider reports them. An agent past either stops before its next model call, its turn ends with a notice ("Agent token limit reached…", like the step limit's), and that is what its parent hears. A repository's profile may set them too, since they only lower what an agent may spend.
 - `max_subagents` caps how many subagents work at once; 0, the default, means no limit. It is profile-only, so a repository can't raise it. A message that would start one more is refused with `too_many_subagents` and a sentence telling the model to wait for a report or message a working one; a message to a working subagent still waits for its next turn. ACP, `fx ask`, and the TUI read it, and `fx config get max_subagents` shows it.
 
 ### Bug Fixes
 
+- Gemini's OpenAI-compatible endpoint works with tools. It sends each tool call whole, with an `id` and no `index`, and ends the reply with `finish_reason: "stop"`, which fx refused as a malformed chunk and a finish that disagreed with its calls. A call without an index is now placed by its `id` (a delta with neither continues the last call), and such a reply's `stop` reads as `tool_calls`. Indexed calls ending in `stop` are still refused. Chat Completions providers in the CLI and libfx's host provider share the fix.
+- Over ACP, the `subagent` tool now lists the agent profiles a subagent can start in (the user's `~/.fx/agents`, and the repository's when `project_config` allows), as `fx` itself does, whenever there is one besides fx's built-in `main` and `agent`. Before, an ACP host's profiles could be started by name, but the model was never told they existed. With only the built-ins, an ACP request is unchanged.
 - An answer the provider cut off at its output limit is no longer replayed as a completed answer. Retrying that turn by ID, after a restart or in the same process, reports `max_output_tokens` instead of `end_turn`. The saved turn records `output_limited`, so a journal or checkpoint holding one is version 5, which fx 0.0.16 and 0.0.17 refuse as newer rather than misread. Journals written by fx 0.0.17 before this fix never recorded the cutoff.
 - `printf` with data that starts with `--` takes the shell path instead of running `/usr/bin/printf` directly, which on uutils read it as an option (the upstream repair, backported).
 

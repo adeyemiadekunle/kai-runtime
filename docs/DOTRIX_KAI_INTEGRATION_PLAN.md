@@ -52,7 +52,7 @@ Not yet: tools filtered by work mode. Plan turns still run every engine under Do
 
 **Decision.** Keep Lyra, Orion, Vega, Juno, and Echo as Dotrix scheduler tasks, each a separate SDK engine with its own journal, contract, model, and key. This is already built (`delegation.py`, `specialist_sessions.py`) with leases, fencing, and continuity checks the runtime's subagent host doesn't have. Do not move named specialists onto in-process runtime children.
 
-**Change in the fork.** None required. Optional later: pass a host-supplied correlation identifier through SDK turn events if a Dotrix consumer needs it for attribution. The run and task IDs already correlate today.
+**Change in the fork.** None required. The optional correlation identifier is done in 0.0.17-kai.2: `prompt()` and `resume()` take a `correlationId` that the turn, each of its events, and its result carry (`sdk/tests/test-agent-correlation.mjs`). Dotrix can attach a run or task ID with it; the host's `turnId` (its message ID) already correlates today.
 
 **Evidence.** The existing Dotrix specialist and continuity suites on the fork artifact (passing in Phase 1, see [Phase 1 results](DOTRIX_KAI_PHASE1_COMPATIBILITY.md)).
 
@@ -74,7 +74,7 @@ Not yet: tools filtered by work mode. Plan turns still run every engine under Do
 | A turn that ends while a child works | The turn waits for the child's report and its answer before `end_turn` | Works |
 | Workers at once | Only the 256-child registry cap | **Added `max_subagents`** |
 | Steps per child | Children inherit `max_agent_steps` | Unchanged; Dotrix sets no step limit today |
-| Per-child time and tokens | No per-child budget | Open; bounded today by the turn's own limits |
+| Per-child steps and tokens | A profile's `max_steps` lowers the child's step limit; its `max_tokens` stops a turn once its requests' reported input and output reach it, with a notice the parent hears (0.0.17-kai.2) | **Added**; Dotrix's workers set them. No time limit yet: Stop and the turn's own timeout bound a child's time |
 | Visibility | A child's tool calls are not `session/update`s, but fx's opt-in `libfx/hook` events carry them, with each child's session and the `delegation` that started it | **Dotrix's driver now maps them** |
 
 `max_subagents` is a profile-only setting (0, the default, means no limit). Under the admission lock, before admission records anything, a message that would start work on one more child while that many work is refused with `too_many_subagents` and a sentence telling the model to wait for a report or message a working one. A message to a working child still queues for its next turn. Tested in `tool_host.zig`. Dotrix's cloud driver and local profile set it to 2, Dotrix's bound for parallel builds.
@@ -118,8 +118,8 @@ Private package name, scope, registry, and CI credentials; a version scheme that
 | 3 | Fork, then Dotrix | D4 audit (done), `max_subagents`, worker activity in Codes | `tool_host.zig` tests; Dotrix driver test; probes through the Dotrix driver |
 | 4 | Dotrix | Pin the fork for Chat; widen the one truncation test; harness listing `("0.0.16",)` only | Chat suites on the pinned artifact. Done: Dotrix #281 pins `@kunemi-group/kai@0.0.17-kai.1`. |
 | 5 | Dotrix | Codes on the fork binary with D1 and D2; profile digest pinning | Coding suites and a real ACP turn with the built binary. Done: D2's profile and digest (above) and the binary part: Dotrix #282 installs `@kunemi-group/kai-cli-linux-<cpu>@0.0.17-kai.1` in the coding image, pinned by SHA-256, and refuses an fx without `project_config` (upstream 0.0.17 reports the same version). |
-| 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children |
-| 7 | Both | D7 recovery fixtures, Phase 2 provider checks | Cross-version and provider matrices |
+| 6 | Dotrix | D4 worker profiles and child event mapping | Coding suites with children. Done: Dotrix #289 (explorer, tester, reviewer, pinned with the session, with step and token limits); the profile listing over ACP is in 0.0.17-kai.2. |
+| 7 | Both | D7 recovery fixtures, Phase 2 provider checks | Cross-version and provider matrices. D7 done: a session saved by 0.0.17-kai.1 resumes on the next build, and saved state the engine can't read starts a new conversation and says so (Dotrix #289). Gemini's tool calls work in 0.0.17-kai.2; paid provider checks remain. |
 | 8 | Both | Retire legacy engines, then branding | Per the [migration plan](DOTRIX_KAI_MIGRATION_PLAN.md) |
 
 ## Proposed `src/dotrix/` layout, reconsidered

@@ -406,6 +406,13 @@ const journalRecordFormat = "libfx-journal-v1";
 const defaultCheckpointAfterBytes = 1024 * 1024;
 // A turn id reaches the journal and tool calls; the core applies the same rule.
 const turnIdRule = "1 to 128 letters, digits, '.', '_' or '-'";
+// A host's own identifier for a turn (its run or task), echoed on the turn's events and result.
+const correlationIdRule = "a string of 1 to 256 characters without control characters";
+const validCorrelationId = (value) =>
+  typeof value === "string" && value.length >= 1 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
+const checkCorrelationId = (value) => {
+  if (value !== undefined && !validCorrelationId(value)) throw new TypeError(`correlationId must be ${correlationIdRule}`);
+};
 
 function validTurnId(id) {
   return typeof id === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(id);
@@ -1271,7 +1278,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
   // `tests/tla/durable/Resumption.tla`.
   const resumeOpenTurn = (promptOptions) => {
     const { rerun, answered } = settleAmbiguous(promptOptions.onAmbiguous);
-    return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered);
+    return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered, promptOptions.correlationId);
   };
   // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
@@ -1941,18 +1948,19 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
       const turnId = promptOptions.turnId;
       if (turnId !== undefined && !validTurnId(turnId)) throw new TypeError(`turnId must be ${turnIdRule}`);
+      checkCorrelationId(promptOptions.correlationId);
       checkOnAmbiguous(promptOptions.onAmbiguous);
       if (turnId !== undefined && journal) {
         if (resumable && turnId === openTurnId) {
           resumable = false;
           return resumeOpenTurn(promptOptions);
         }
-        if (turnId === lastTurnId) return endedTurn(turnId, lastTurnStopReason ?? "end_turn");
+        if (turnId === lastTurnId) return endedTurn(turnId, lastTurnStopReason ?? "end_turn", promptOptions.correlationId);
       }
       // A new prompt ends a turn the last process left open as interrupted.
       resumable = false;
       ambiguousCalls = [];
-      return normalizeTurn(startTurn(input, { ...promptOptions, turnId: turnId ?? `turn_${crypto.randomUUID()}` }));
+      return normalizeTurn(startTurn(input, { ...promptOptions, turnId: turnId ?? `turn_${crypto.randomUUID()}` }), [], promptOptions.correlationId);
     },
     /**
      * Continues the turn the last process left open, with no new input, and
@@ -1966,6 +1974,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       if (journalFailure) throw reportJournalFailure();
       if (handedOff) throw handedOffError();
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
+      checkCorrelationId(promptOptions.correlationId);
       checkOnAmbiguous(promptOptions.onAmbiguous);
       if (resumable) {
         resumable = false;
@@ -2076,7 +2085,9 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
 
   // `answered`: calls a resumed turn answers as possibly run before it goes
   // on, whose `tool_end` comes first.
-  function normalizeTurn(rawTurn, answered = []) {
+  function normalizeTurn(rawTurn, answered = [], correlationId = undefined) {
+    // A host's correlationId, when it gave one, on every event and the result; otherwise nothing changes.
+    const stamp = correlationId === undefined ? (value) => value : (value) => ({ ...value, correlationId });
     const toolNames = new Map();
     const started = new Set();
     const eventFor = (update) => {
@@ -2118,13 +2129,14 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       }
       return null;
     };
-    const result = rawTurn.result.then((value) => ({
+    const result = rawTurn.result.then((value) => stamp({
       stopReason: value.stopReason,
       usage: normalizeTurnUsage(value.usage),
     }));
     void result.catch(() => {});
     return {
       id: rawTurn.id ?? null,
+      ...(correlationId === undefined ? {} : { correlationId }),
       cancel(cancelOptions) { rawTurn.cancel(cancelOptions); },
       steer(input, id) {
         if (id !== undefined && !validTurnId(id)) throw new TypeError(`steer id must be ${turnIdRule}`);
@@ -2135,11 +2147,11 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
           for (const call of answered) {
-            yield { type: "tool_end", id: call.id, name: call.name, content: unfinishedToolOutput, isError: true };
+            yield stamp({ type: "tool_end", id: call.id, name: call.name, content: unfinishedToolOutput, isError: true });
           }
           for await (const update of rawTurn) {
             const event = eventFor(update);
-            if (event) yield event;
+            if (event) yield stamp(event);
           }
         })();
         return {
@@ -2155,10 +2167,11 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
 
   // A turn the journal shows already ended, returned for a retried prompt,
   // with how it ended: an answer stopped at the output limit stays one.
-  function endedTurn(id, stopReason) {
+  function endedTurn(id, stopReason, correlationId = undefined) {
     return {
       id,
-      result: Promise.resolve({ stopReason, usage: {} }),
+      ...(correlationId === undefined ? {} : { correlationId }),
+      result: Promise.resolve({ stopReason, usage: {}, ...(correlationId === undefined ? {} : { correlationId }) }),
       cancel() {},
       steer() { return Promise.reject(new Error("no prompt is running")); },
       withdraw() { return Promise.resolve("already_placed"); },
