@@ -36,6 +36,7 @@ const scripts = [
   "test-browser-import.mjs",
   "test-agent-bootstrap.mjs",
   "test-agent-step-limit.mjs",
+  "test-agent-correlation.mjs",
   "test-agent-effort.mjs",
   "test-agent-fast.mjs",
   "test-agent-prompt-cache.mjs",

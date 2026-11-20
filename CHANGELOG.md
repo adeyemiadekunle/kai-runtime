@@ -6,6 +6,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 ### New Features
 
+- libfx: `prompt()` and `resume()` take a `correlationId`, the host's own identifier for the turn (its run or task, say). The turn, every one of its events, and its result carry it; a turn without one is unchanged. Bounded (1 to 256 characters, no control characters) and refused before the turn starts otherwise.
 - An agent profile can limit each turn of an agent started in it: `max_steps`, which lowers its parent's step limit, and `max_tokens`, counting every model request's input and output as the provider reports them. An agent past either stops before its next model call, its turn ends with a notice ("Agent token limit reached…", like the step limit's), and that is what its parent hears. A repository's profile may set them too, since they only lower what an agent may spend.
 - `max_subagents` caps how many subagents work at once; 0, the default, means no limit. It is profile-only, so a repository can't raise it. A message that would start one more is refused with `too_many_subagents` and a sentence telling the model to wait for a report or message a working one; a message to a working subagent still waits for its next turn. ACP, `fx ask`, and the TUI read it, and `fx config get max_subagents` shows it.
 
