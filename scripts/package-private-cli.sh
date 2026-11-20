@@ -98,6 +98,7 @@ for archive in "$out"/cli/*.tgz; do
     echo "$package@$LIBFX_VERSION is already published, unchanged"
     continue
   fi
-  npm publish "$archive" --ignore-scripts --userconfig "$npmrc"
+  # Every Kai version is a prerelease of the fx version it builds on, and the only line published, so it is latest.
+  npm publish "$archive" --tag latest --ignore-scripts --userconfig "$npmrc"
   echo "published $package@$LIBFX_VERSION"
 done
