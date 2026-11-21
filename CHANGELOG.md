@@ -40,6 +40,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - `test-node-package.mjs` checks the private scope's names, aliases, registry, and commit.
 - E2E: `project-config.test.ts`; journal tests for cut-off turns; released 0.0.16 and 0.0.17 journal fixtures; Zig tests for the new saved-format versions, the gated loaders, and `max_subagents`.
 - The integration plan records 0.0.17-kai.3: `_meta.fx.shell` and `fx/shells` under D6, added for Dotrix's Codes, and how Dotrix keeps commands running between turns (dotrix#294).
+- D2 in the integration plan: Dotrix's local fx turns now get Kai's contract as `systemPrompt` too (dotrix#296), not the whole brief in the prompt.
 - Docs: the Dotrix migration plan, Phase 1 compatibility results, the integration plan, and the local CI record kept while GitHub Actions is unavailable. `.gitignore` covers Python `__pycache__`.
 
 ## 0.0.17
