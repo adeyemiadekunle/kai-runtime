@@ -4,6 +4,9 @@ Current baseline decision: use [fx v0.0.17 plus the upstream printf backport](DO
 
 ## Current execution order
 
+**The order now lives in Dotrix (21 November 2026).** Dotrix's [roadmap](https://github.com/adeyemiadekunle/dotrix/blob/stage/docs/product.md#roadmap-the-solo-beta-on-the-kai-runtime) combines these phases with the solo beta and sets their order. Decided there: the beta launches with the Kai runtime as the default engine for new Chat and Code sessions, so the first half of phase 6 (Kai by default, with rollback rehearsed) comes before the beta. Retiring the legacy engines and branding (phase 7) come after it. Phases 0 to 5 are done or built; the evidence below and in the [integration plan](DOTRIX_KAI_INTEGRATION_PLAN.md) stays here.
+
+
 Updated at the user's direction on 18 November 2026. Branding is the final phase. Keep `fx`, `libfx`, `FX_*`, `.fx`, and existing stored runtime identifiers during the functional migration. The older numbered sections below retain their implementation detail; this table controls their execution order.
 
 | Phase | Work | Evidence required before dependent rollout |
