@@ -42,6 +42,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - E2E: `project-config.test.ts`; journal tests for cut-off turns; released 0.0.16 and 0.0.17 journal fixtures; Zig tests for the new saved-format versions, the gated loaders, and `max_subagents`.
 - The integration plan records 0.0.17-kai.3: `_meta.fx.shell` and `fx/shells` under D6, added for Dotrix's Codes, and how Dotrix keeps commands running between turns (dotrix#294).
 - D2 in the integration plan: Dotrix's local fx turns now get Kai's contract as `systemPrompt` too (dotrix#296), not the whole brief in the prompt.
+- Integration plan (D2, D3): updated for `dotrix#319` (Chat upgraded to `@kunemi-group/kai@0.0.17-kai.3`, `fx` set as default for Chat and Code, `--plan` tool and worker filtering in ACP, local session resumption with `profile_digest`, and Chat `correlationId` wiring).
 - Docs: the Dotrix migration plan, Phase 1 compatibility results, the integration plan, and the local CI record kept while GitHub Actions is unavailable. `.gitignore` covers Python `__pycache__`.
 
 ## 0.0.17
