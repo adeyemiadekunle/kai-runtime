@@ -19,6 +19,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - Over ACP, the `subagent` tool now lists the agent profiles a subagent can start in (the user's `~/.fx/agents`, and the repository's when `project_config` allows), as `fx` itself does, whenever there is one besides fx's built-in `main` and `agent`. Before, an ACP host's profiles could be started by name, but the model was never told they existed. With only the built-ins, an ACP request is unchanged.
 - An answer the provider cut off at its output limit is no longer replayed as a completed answer. Retrying that turn by ID, after a restart or in the same process, reports `max_output_tokens` instead of `end_turn`. The saved turn records `output_limited`, so a journal or checkpoint holding one is version 5, which fx 0.0.16 and 0.0.17 refuse as newer rather than misread. Journals written by fx 0.0.17 before this fix never recorded the cutoff.
 - `printf` with data that starts with `--` takes the shell path instead of running `/usr/bin/printf` directly, which on uutils read it as an option (the upstream repair, backported).
+- Merged upstream `adeyemiadekunle/kai` changes through commit `170f50e4` (931 commits): shared MCP server processes, subagent and shell cancellation and steering repairs, crash diagnostics, `max` reasoning effort, and structured `Refusal` handling (preserving `max_subagents` enforcement through `Refusal.too_many_subagents`).
 
 ### Security
 
@@ -44,6 +45,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - D2 in the integration plan: Dotrix's local fx turns now get Kai's contract as `systemPrompt` too (dotrix#296), not the whole brief in the prompt.
 - Integration plan (D2, D3): updated for `dotrix#319` (Chat upgraded to `@kunemi-group/kai@0.0.17-kai.3`, `fx` set as default for Chat and Code, `--plan` tool and worker filtering in ACP, local session resumption with `profile_digest`, and Chat `correlationId` wiring).
 - Docs: the Dotrix migration plan, Phase 1 compatibility results, the integration plan, and the local CI record kept while GitHub Actions is unavailable. `.gitignore` covers Python `__pycache__`.
+- Synced PGSO corpus and verification tests, `cli_config.zig` resolved keys, and local macOS arm64 verification results in `docs/DOTRIX_KAI_LOCAL_CI.md` for the upstream merge (`170f50e4`).
 
 ## 0.0.17
 
@@ -86,7 +88,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - Toolbox raised prompt cache reads from 61.3% to 82.0% of later input in live tests across 9 model families.
 - Built-in tool definitions are 48.0% smaller than in 0.0.16, and a new session's first request is 32.4% smaller.
 - libfx's native addons are 10.1% to 12.9% smaller than in 0.0.16.
-- The Linux arm64 and x86_64 binaries are 37.6% and 32.2% smaller than in 0.0.16.
+- The Linux arm64 and x86_64 binaries are 36.6% and 31.1% smaller than in 0.0.16.
 - libfx requests now use AI Gateway's prompt cache.
 - A shell result for a command with no output is about 70 characters instead of about 340.
 - Skill descriptions in the toolbox menu stop at 200 characters, down from 1,024.
@@ -129,6 +131,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - Menus and pickers match letters in order, so `/mdl` finds `/model`.
 - The model picker labels Fast models and Fast mode apart and lists newer GPT versions first.
 - Ordered lists in replies align their numbers.
+- Tool group headers say what the group did, such as `Edited a file, ran commands`, instead of a tool-call count.
 - Skill discovery warnings no longer show at startup.
 - MCP config changes made outside a session load at the next prompt.
 - `fx mcp add` signs in to a new server that needs it, and `--no-login` skips that.
