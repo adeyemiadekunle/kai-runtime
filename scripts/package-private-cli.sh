@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Packs the Kai runtime's fx command for GitHub Packages as
-# @kunemi-group/kai-cli-linux-x64 and @kunemi-group/kai-cli-linux-arm64, and
-# with --publish publishes them. Dotrix's coding image installs one and checks
-# its binary's SHA-256, which it pins (infra/coding/Dockerfile). Used by
-# .github/workflows/publish-private-libfx.yml and, while hosted CI is
-# unavailable, run by hand.
+# @kunemi-group/kai-cli-linux-x64, @kunemi-group/kai-cli-linux-arm64, and
+# optionally @kunemi-group/kai-cli-darwin-arm64 and
+# @kunemi-group/kai-cli-darwin-x64, and with --publish publishes them.
 #
 #   scripts/package-private-cli.sh <bin-dir> <out-dir> [--publish]
 #
-# <bin-dir> holds fx-x86_64 and fx-aarch64: static Linux builds from this
-# commit (zig build -Doptimize=ReleaseSafe -Dcpu=baseline
-# -Dtarget=<arch>-linux-musl). The environment is as for
+# <bin-dir> holds fx-x86_64 and fx-aarch64 (static Linux builds from this
+# commit: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+# -Dtarget=<arch>-linux-musl) and may also hold fx-darwin-arm64 and
+# fx-darwin-x64 (macOS builds). The environment is as for
 # package-private-libfx.sh: LIBFX_VERSION, LIBFX_SCOPE, LIBFX_NAME,
 # LIBFX_REGISTRY and, to publish, NODE_AUTH_TOKEN.
 set -euo pipefail
@@ -35,11 +34,46 @@ if [ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]; then
 fi
 base_version=$(grep 'pub const version' "$root/src/main.zig" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+pack_cli_package() {
+  local os=$1 cpu=$2 binary=$3 os_label=$4
+  local package="$scope/$name-cli-$os-$cpu"
+  local dir="$out/cli/$name-cli-$os-$cpu"
+  mkdir -p "$dir/bin"
+  install -m 0755 "$binary" "$dir/bin/fx"
+  cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$dir/"
+  local digest
+  digest=$(sha256_file "$dir/bin/fx")
+  printf '%s  bin/fx\n' "$digest" > "$dir/fx.sha256"
+  printf '# %s\n\nThe Kai runtime'"'"'s fx command (fx %s with the Kai runtime'"'"'s changes) for %s %s, built from %s. Its SHA-256 is in fx.sha256.\n' \
+    "$package" "$base_version" "$os_label" "$cpu" "$commit" > "$dir/README.md"
+  jq -n --arg name "$package" --arg version "$LIBFX_VERSION" --arg os "$os" --arg cpu "$cpu" --arg os_label "$os_label" --arg registry "$registry" --arg commit "$commit" '{
+    name: $name, version: $version,
+    description: "The Kai runtime'"'"'s fx command for \($os_label) \($cpu)",
+    os: [$os], cpu: [$cpu], files: ["bin/fx", "fx.sha256", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+    repository: { type: "git", url: "git+https://github.com/adeyemiadekunle/kai-runtime.git" },
+    publishConfig: { registry: $registry }, license: "Apache-2.0", gitHead: $commit
+  }' > "$dir/package.json"
+  npm pack "$dir" --ignore-scripts --pack-destination "$out/cli" --json > "$dir.pack.json"
+  local files
+  files=$(jq -r '[.[0].files[].path] | sort | join(",")' "$dir.pack.json")
+  [ "$files" = "LICENSE,README.md,THIRD_PARTY_NOTICES.md,bin/fx,fx.sha256,package.json" ] || { echo "$package has $files" >&2; exit 1; }
+  printf '%s  %s\n' "$digest" "$package" >> "$out/cli/fx.sha256"
+}
+
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 rm -rf "$out/cli"
 mkdir -p "$out/cli"
 : > "$out/cli/fx.sha256"
+
 for pair in "x64 x86_64" "arm64 aarch64"; do
   read -r cpu arch <<< "$pair"
   binary="$bins/fx-$arch"
@@ -49,34 +83,37 @@ for pair in "x64 x86_64" "arm64 aarch64"; do
   case "$arch" in x86_64) want="x86-64" ;; aarch64) want="ARM aarch64" ;; esac
   [[ "$description" == *"$want"* && "$description" == *"statically linked"* ]] || {
     echo "$binary is not a static $arch executable: $description" >&2; exit 1; }
-  package="$scope/$name-cli-linux-$cpu"
-  dir="$out/cli/$name-cli-linux-$cpu"
-  mkdir -p "$dir/bin"
-  install -m 0755 "$binary" "$dir/bin/fx"
-  cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$dir/"
-  digest=$(sha256sum "$dir/bin/fx" | cut -d' ' -f1)
-  printf '%s  bin/fx\n' "$digest" > "$dir/fx.sha256"
-  printf '# %s\n\nThe Kai runtime'"'"'s fx command (fx %s with the Kai runtime'"'"'s changes) for Linux %s, built from %s. Its SHA-256 is in fx.sha256.\n' \
-    "$package" "$base_version" "$cpu" "$commit" > "$dir/README.md"
-  jq -n --arg name "$package" --arg version "$LIBFX_VERSION" --arg cpu "$cpu" --arg registry "$registry" --arg commit "$commit" '{
-    name: $name, version: $version,
-    description: "The Kai runtime'"'"'s fx command for Linux \($cpu)",
-    os: ["linux"], cpu: [$cpu], files: ["bin/fx", "fx.sha256", "LICENSE", "THIRD_PARTY_NOTICES.md"],
-    repository: { type: "git", url: "git+https://github.com/adeyemiadekunle/kai-runtime.git" },
-    publishConfig: { registry: $registry }, license: "Apache-2.0", gitHead: $commit
-  }' > "$dir/package.json"
-  npm pack "$dir" --ignore-scripts --pack-destination "$out/cli" --json > "$dir.pack.json"
-  files=$(jq -r '[.[0].files[].path] | sort | join(",")' "$dir.pack.json")
-  [ "$files" = "LICENSE,README.md,THIRD_PARTY_NOTICES.md,bin/fx,fx.sha256,package.json" ] || { echo "$package has $files" >&2; exit 1; }
-  printf '%s  %s\n' "$digest" "$package" >> "$out/cli/fx.sha256"
+  pack_cli_package linux "$cpu" "$binary" Linux
 done
+
+for pair in "arm64 arm64" "x64 x86_64"; do
+  read -r cpu mach_arch <<< "$pair"
+  binary="$bins/fx-darwin-$cpu"
+  [ -f "$binary" ] || continue
+  description=$(file -b "$binary")
+  arch_ok=false
+  case "$mach_arch" in
+    arm64) [[ "$description" == *"arm64"* ]] && arch_ok=true ;;
+    x86_64) [[ "$description" == *"x86_64"* || "$description" == *"x86-64"* ]] && arch_ok=true ;;
+  esac
+  [[ "$description" == *"Mach-O"* && "$arch_ok" == true ]] || {
+    echo "$binary is not a Mach-O $mach_arch executable: $description" >&2; exit 1; }
+  pack_cli_package darwin "$cpu" "$binary" macOS
+done
+
 license=$(jq -r .license "$root/sdk/package.json")
 [ "$license" = "Apache-2.0" ] || { echo "update the license in this script: sdk/package.json says $license" >&2; exit 1; }
 
 # This machine's binary runs and reports the version it was built as.
-case "$(uname -m)" in x86_64) cpu=x64 ;; aarch64) cpu=arm64 ;; *) cpu= ;; esac
-if [ -n "$cpu" ]; then
-  reported=$("$out/cli/$name-cli-linux-$cpu/bin/fx" --version)
+host_pkg=""
+case "$(uname -s):$(uname -m)" in
+  Linux:x86_64) host_pkg="$out/cli/$name-cli-linux-x64/bin/fx" ;;
+  Linux:aarch64) host_pkg="$out/cli/$name-cli-linux-arm64/bin/fx" ;;
+  Darwin:arm64) host_pkg="$out/cli/$name-cli-darwin-arm64/bin/fx" ;;
+  Darwin:x86_64) host_pkg="$out/cli/$name-cli-darwin-x64/bin/fx" ;;
+esac
+if [ -n "$host_pkg" ] && [ -x "$host_pkg" ]; then
+  reported=$("$host_pkg" --version)
   [[ "$reported" == *"$base_version"* ]] || { echo "fx --version said $reported" >&2; exit 1; }
   echo "fx runs: $reported"
 fi

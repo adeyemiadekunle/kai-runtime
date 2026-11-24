@@ -57,9 +57,11 @@ pub const AdmissionSnapshot = struct {
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
     /// The child's profile's limits on a turn: at most this many steps (below
-    /// its parent's limit) and tokens. Null sets none of its own.
+    /// its parent's limit), tokens, and wall-clock milliseconds. Null sets
+    /// none of its own.
     step_limit: ?usize = null,
     token_limit: ?u64 = null,
+    duration_limit_ms: ?u64 = null,
 
     /// An owned copy, made the way `captureAdmission` makes the original.
     pub fn clone(self: *const AdmissionSnapshot, alloc: Allocator) AdmissionError!AdmissionSnapshot {
@@ -80,6 +82,7 @@ pub const AdmissionSnapshot = struct {
             .mcp_view = self.mcp_view,
             .step_limit = self.step_limit,
             .token_limit = self.token_limit,
+            .duration_limit_ms = self.duration_limit_ms,
         });
     }
 
@@ -114,6 +117,7 @@ pub const AdmissionInput = struct {
     mcp_view: ?mcp_access.View = null,
     step_limit: ?usize = null,
     token_limit: ?u64 = null,
+    duration_limit_ms: ?u64 = null,
 };
 
 pub const AdmissionError = error{
@@ -194,6 +198,7 @@ pub fn captureAdmission(
         .mcp_view = mcp_view,
         .step_limit = input.step_limit,
         .token_limit = input.token_limit,
+        .duration_limit_ms = input.duration_limit_ms,
     };
 }
 
@@ -325,10 +330,12 @@ test "a cloned admission owns copies of every field" {
         .permission_mode = .ask,
         .tool_names = &tools,
         .authority_generation = 7,
+        .duration_limit_ms = 300_000,
     });
     var copy = try original.clone(alloc);
     defer copy.deinit(alloc);
     original.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 300_000), copy.duration_limit_ms);
     try std.testing.expectEqualStrings("parent", copy.parent_id);
     try std.testing.expectEqualStrings("source", copy.source_id);
     try std.testing.expectEqualStrings("test-model", copy.model);

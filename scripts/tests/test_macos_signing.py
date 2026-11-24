@@ -112,7 +112,8 @@ if args and args[0] == "set-key-partition-list":
         print("error: The specified item could not be found in the keychain.", file=sys.stderr)
         raise SystemExit(1)
 if args and args[0] == "find-identity":
-    print('  1) HASH "{SIGNING_IDENTITY}"')
+    found_identity = os.environ.get("FX_SIGNING_TEST_FIND_IDENTITY", "{SIGNING_IDENTITY}")
+    print(f'  1) HASH "{{found_identity}}"')
     print("     1 valid identities found")
 ''',
         )
@@ -517,6 +518,30 @@ else:
                 event_log.read_text(encoding="utf-8"),
             )
             self.assertEqual([], list(runner_temp.iterdir()))
+
+    def test_honors_custom_signing_identity_identifier_and_team_overrides(self) -> None:
+        custom_identity = "Developer ID Application: Kunemi (KUNEMI1234)"
+        with tempfile.TemporaryDirectory(prefix="fx-macos-signing-custom-") as tmp:
+            root = pathlib.Path(tmp)
+            result, binary, runner_temp, event_log = self.run_script(
+                root,
+                {
+                    "APPLE_SIGNING_IDENTITY": custom_identity,
+                    "APPLE_SIGNING_IDENTIFIER": "com.kunemi.kai",
+                    "APPLE_SIGNING_TEAM_ID": "KUNEMI1234",
+                    "FX_SIGNING_TEST_FIND_IDENTITY": custom_identity,
+                    "FX_SIGNING_TEST_IDENTIFIER": "com.kunemi.kai",
+                    "FX_SIGNING_TEST_TEAM_ID": "KUNEMI1234",
+                },
+            )
+
+            output = result.stdout + result.stderr
+            self.assertEqual(0, result.returncode, output)
+            self.assertEqual(b"unsigned\nsigned\n", binary.read_bytes())
+            self.assertEqual([], list(runner_temp.iterdir()))
+            events = event_log.read_text(encoding="utf-8")
+            self.assertIn(f"--sign {custom_identity}", events)
+            self.assertIn("--identifier com.kunemi.kai", events)
 
 
 class MacosSigningWorkflowTests(unittest.TestCase):

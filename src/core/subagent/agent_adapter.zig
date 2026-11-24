@@ -147,6 +147,67 @@ const Context = struct {
     }
 };
 
+const watchdog_poll_interval_ns: u64 = 25 * std.time.ns_per_ms;
+
+/// Enforces `duration_limit_ms` for one child turn without setting the slot's
+/// caller-owned cancel flag, so timeouts remain distinguishable from user
+/// cancellation in `managed_owner`.
+const DurationWatchdog = struct {
+    parent_cancel: *std.atomic.Value(bool),
+    child_cancel: std.atomic.Value(bool),
+    limit_ms: ?u64,
+    deadline_ms: i64 = 0,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    timed_out: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    fn init(parent_cancel: *std.atomic.Value(bool), limit_ms: ?u64) DurationWatchdog {
+        return .{
+            .parent_cancel = parent_cancel,
+            .child_cancel = std.atomic.Value(bool).init(parent_cancel.load(.seq_cst)),
+            .limit_ms = limit_ms,
+        };
+    }
+
+    fn cancelFlag(self: *DurationWatchdog) *std.atomic.Value(bool) {
+        return if (self.limit_ms != null) &self.child_cancel else self.parent_cancel;
+    }
+
+    fn start(self: *DurationWatchdog) !void {
+        const limit_ms = self.limit_ms orelse return;
+        const clamped_ms: i64 = @intCast(@min(limit_ms, @as(u64, std.math.maxInt(i64))));
+        self.deadline_ms = std.math.add(i64, io_mod.milliTimestamp(), clamped_ms) catch std.math.maxInt(i64);
+        self.thread = try std.Thread.spawn(.{}, runThread, .{self});
+    }
+
+    fn stop(self: *DurationWatchdog) void {
+        self.done.store(true, .seq_cst);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    fn didTimeout(self: *const DurationWatchdog) bool {
+        return !self.parent_cancel.load(.seq_cst) and self.timed_out.load(.seq_cst);
+    }
+
+    fn runThread(self: *DurationWatchdog) void {
+        while (!self.done.load(.seq_cst)) {
+            if (self.parent_cancel.load(.seq_cst)) {
+                self.child_cancel.store(true, .seq_cst);
+                return;
+            }
+            if (io_mod.milliTimestamp() >= self.deadline_ms) {
+                self.timed_out.store(true, .seq_cst);
+                self.child_cancel.store(true, .seq_cst);
+                return;
+            }
+            io_mod.sleep(watchdog_poll_interval_ns);
+        }
+    }
+};
+
 pub fn run(
     config: Config,
     turn: *execution.TurnContext,
@@ -215,16 +276,20 @@ pub fn run(
         return error.ProviderFailed;
     }
     defer turn.workerRuntime().finishProcessing();
+    var watchdog = DurationWatchdog.init(cancel, admission.duration_limit_ms);
+    defer watchdog.stop();
+    const effective_cancel = watchdog.cancelFlag();
     var context = Context{
         .config = routed_config,
         .turn = turn,
         .admission = admission,
-        .cancel = cancel,
+        .cancel = effective_cancel,
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
     turn.workspace_capture = config.workspace_capture;
-    turn.capture_cancel = cancel;
+    turn.capture_cancel = effective_cancel;
+    defer turn.capture_cancel = cancel;
     turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
@@ -310,6 +375,10 @@ pub fn run(
     defer toolbox_arena_state.deinit();
     const arena_for_toolbox = toolbox_arena_state.allocator();
     const deps = runtimeDeps(&context);
+    watchdog.start() catch |err| {
+        turn.setFailureDiagnostic("time_limit_watchdog_failed", @errorName(err));
+        return error.ProviderFailed;
+    };
     agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
         &deps,
@@ -341,9 +410,10 @@ pub fn run(
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = childStepLimit(config.tool_context.agent_step_limit, admission.step_limit),
             .agent_token_limit = admission.token_limit orelse 0,
+            .agent_duration_limit_ms = admission.duration_limit_ms orelse 0,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
-            .cancel_flag = cancel,
+            .cancel_flag = effective_cancel,
             .fast_mode = config.tool_context.fast_mode,
             .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
@@ -362,6 +432,10 @@ pub fn run(
         },
         prompt,
     ) catch |err| {
+        if (watchdog.didTimeout()) {
+            turn.setFailureDiagnostic("time_limit", agent_runtime.Config.default_duration_limit_notice);
+            return error.ProviderFailed;
+        }
         const mapped: execution.ServiceError = switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Cancelled => error.Cancelled,
@@ -371,6 +445,10 @@ pub fn run(
         debug_trace.eventf("subagent", "child_execution_failed", trace_context, "child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
         return mapped;
     };
+    if (watchdog.didTimeout()) {
+        turn.setFailureDiagnostic("time_limit", agent_runtime.Config.default_duration_limit_notice);
+        return error.ProviderFailed;
+    }
     return finalRunOutcome(context.turn_outcome);
 }
 
@@ -1201,4 +1279,34 @@ test "a child's profile can only lower its parent's step limit" {
     try std.testing.expectEqual(@as(usize, 25), childStepLimit(25, 90));
     try std.testing.expectEqual(@as(usize, 7), childStepLimit(0, 7));
     try std.testing.expectEqual(@as(usize, 0), childStepLimit(0, null));
+}
+
+test "duration watchdog cancels child on expiry without setting parent cancel" {
+    var parent_cancel = std.atomic.Value(bool).init(false);
+    var watchdog = DurationWatchdog.init(&parent_cancel, 1);
+    defer watchdog.stop();
+    try watchdog.start();
+
+    const deadline = io_mod.milliTimestamp() + 2000;
+    while (!watchdog.cancelFlag().load(.seq_cst) and io_mod.milliTimestamp() < deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(watchdog.cancelFlag().load(.seq_cst));
+    try std.testing.expect(watchdog.didTimeout());
+    try std.testing.expect(!parent_cancel.load(.seq_cst));
+}
+
+test "duration watchdog forwards parent cancel without reporting timeout" {
+    var parent_cancel = std.atomic.Value(bool).init(false);
+    var watchdog = DurationWatchdog.init(&parent_cancel, 60_000);
+    defer watchdog.stop();
+    try watchdog.start();
+
+    parent_cancel.store(true, .seq_cst);
+    const deadline = io_mod.milliTimestamp() + 2000;
+    while (!watchdog.cancelFlag().load(.seq_cst) and io_mod.milliTimestamp() < deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(watchdog.cancelFlag().load(.seq_cst));
+    try std.testing.expect(!watchdog.didTimeout());
 }

@@ -203,6 +203,7 @@ pub const Snapshot = struct {
     /// The child's profile's own limits on a turn (`profiles.Profile`).
     step_limit: ?usize = null,
     token_limit: ?u64 = null,
+    duration_limit_ms: ?u64 = null,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.child_id);
@@ -615,6 +616,10 @@ pub const Resolver = struct {
             .mcp_view = mcp_view,
             .step_limit = if (current.profile) |profile| profile.max_steps else null,
             .token_limit = if (current.profile) |profile| profile.max_tokens else null,
+            .duration_limit_ms = if (current.profile) |profile|
+                if (profile.max_duration_seconds) |secs| secs * std.time.ms_per_s else null
+            else
+                null,
         };
     }
 };

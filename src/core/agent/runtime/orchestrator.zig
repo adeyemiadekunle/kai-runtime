@@ -8171,6 +8171,7 @@ fn processQueuedPromptLoop(
     );
     finalization.captured_runtime_context = runtime_context.captured;
     debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
+    const turn_started_ms = io_mod.milliTimestamp();
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         // A turn past its token limit stops before another model call, as one
@@ -8190,6 +8191,25 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 config.token_limit_notice,
                 "token_limit",
+            );
+            return;
+        }
+        // A turn past its wall-clock time limit stops before another model call.
+        if (step > 0 and config.agent_duration_limit_ms != 0 and
+            elapsedDurationMs(turn_started_ms, io_mod.milliTimestamp()) >= config.agent_duration_limit_ms)
+        {
+            debug_trace.logf("agent", "time limit reached step={d} limit_ms={d}", .{ step, config.agent_duration_limit_ms });
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                config.duration_limit_notice,
+                "time_limit",
             );
             return;
         }
@@ -13752,4 +13772,15 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+fn elapsedDurationMs(started_ms: i64, now_ms: i64) u64 {
+    if (now_ms <= started_ms) return 0;
+    return @intCast(now_ms - started_ms);
+}
+
+test "elapsedDurationMs clamps clock skew and returns elapsed milliseconds" {
+    try std.testing.expectEqual(@as(u64, 0), elapsedDurationMs(500, 400));
+    try std.testing.expectEqual(@as(u64, 0), elapsedDurationMs(500, 500));
+    try std.testing.expectEqual(@as(u64, 250), elapsedDurationMs(500, 750));
 }
