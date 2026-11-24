@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { processAlive } from "./process-alive";
 import {
   execFileSync,
   spawn as nodeSpawn,
@@ -19,6 +21,7 @@ import {
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { LineQueue } from "./line-queue";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import { latestTraceReportPath, readTraceReport, traceReportNames, waitForNewTraceReport } from "./trace-report";
 import {
@@ -844,9 +847,9 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("history feedback live complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      // The two commands share one row by their steps, and the feedback comes
-      // after it.
-      const commandsRow = scrollback.indexOf("└ Ran touch, printf");
+      // The two commands share one row by their steps, which is the group's
+      // line, and the feedback comes after it.
+      const commandsRow = scrollback.indexOf("● Ran touch, printf");
       expect(commandsRow).toBeGreaterThanOrEqual(0);
       expect(scrollback.indexOf(feedback)).toBeGreaterThan(commandsRow);
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
@@ -1210,18 +1213,24 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the prepared command matrix.");
-      await activeSession.waitForText("Running ./fxc110-stream.sh", TIMEOUT);
+      // The running command joins the row of the command that ran before it,
+      // so no row of its own shows first and then folds away.
+      const joinedRow = /Running \S*fxc110-fast\.sh, \S*fxc110-stream\.sh/;
+      await activeSession.waitForText(joinedRow, TIMEOUT);
       await Bun.sleep(250);
       const running = await activeSession.captureFullScrollback();
-      expect(running).toContain("Running ./fxc110-stream.sh");
+      expect(running).toMatch(joinedRow);
+      expect(running).not.toContain("Running ./fxc110-stream.sh\n");
       expectNoOutputRows(running);
 
-      // The last command failed, so the group ends in ✗, and its reason line
-      // shows one line of the error while the full output stays in Ctrl-O.
+      // The last command failed, so the group ends in ✗, and its row shows
+      // one line of the error after the command while the full output stays
+      // in Ctrl-O.
       const header = "● Ran commands ✗";
       await activeSession.waitForText(header, TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
-      expect(completed).toContain("✗ exit 7 · FXC110_FAILED_STDERR");
+      expect(completed).toMatch(/Exited 7 .* · FXC110_FAILED_STDERR/);
+      expect(completed).not.toContain("✗ exit 7");
       for (const script of scripts) expect(completed).toContain(script.name);
       expectNoOutputRows(completed);
 
@@ -1276,6 +1285,70 @@ describe("effect-aware command permissions", () => {
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
     90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI and the model see the last line of command output past the output limit",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "long-output-stderr.log");
+      writeFileSync(stderrPath, "");
+      const marker = "FINAL_STEP_FAILED_MARKER";
+      // About 100 KB of steps, past the 64 KiB a running command keeps, then
+      // the line that says which step stopped the build.
+      const script = join(root.workspace, "long-build.sh");
+      writeFileSync(
+        script,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 1000 ]; do\n" +
+          `  printf 'step %04d compiled module %s\\n' "$i" "${"x".repeat(72)}"\n` +
+          "  i=$((i+1))\ndone\n" +
+          `printf '${marker}\\n'\nexit 1\n`,
+      );
+      chmodSync(script, 0o755);
+      let shellResult = "";
+      const gateway = startFakeGateway([
+        toolCall("./long-build.sh", {}, "long_build"),
+        (body) => {
+          // A command that exits nonzero comes back as error text.
+          const request = JSON.parse(body) as {
+            prompt?: Array<{ content?: string | Array<Record<string, unknown>> }>;
+          };
+          const part = (request.prompt ?? [])
+            .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+            .find((item) => item.type === "tool-result" && item.toolCallId === "long_build");
+          const output = part?.output as { type?: string; value?: unknown } | undefined;
+          expect(output?.type).toBe("error-text");
+          shellResult = String(output?.value ?? "");
+          return finalText("LONG_BUILD_REPORTED");
+        },
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "auto" }),
+        stderrPath,
+        width: 120,
+        height: 36,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the long build.");
+      await activeSession.waitForText("LONG_BUILD_REPORTED", TIMEOUT);
+
+      const result = JSON.parse(shellResult) as {
+        exit_code?: number;
+        output_truncated?: boolean;
+        output_delta: string;
+      };
+      expect(result.exit_code).toBe(1);
+      expect(result.output_truncated).toBe(true);
+      expect(result.output_delta).toContain("step 0000 compiled module");
+      expect(result.output_delta.trimEnd().endsWith(marker)).toBe(true);
+      const scrollback = await activeSession.captureFullScrollback();
+      expect(scrollback).toMatch(new RegExp(`Exited 1 .* · ${marker}`));
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -2129,6 +2202,346 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps no part of a secret that a cut splits",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // A fake token, and the only place the trace can hold six A's in a row.
+      const token = "ghp_" + "A".repeat(36);
+      // 250 tokens in a row, so every cut falls inside one. Each command is
+      // about 10 KB, past the failed ring's 8 KiB field and the window's
+      // 1200-byte argument cut, and each prints about 10 KB, past the
+      // 2000-byte result cut. The 20-byte shift moves the second call's cuts
+      // to a different place in the token's 41-byte period.
+      const words = Array(250).fill(token).join(" ");
+      const first = `echo ${words}; exit 1`;
+      const second = `echo ${"s".repeat(20)} ${words}; exit 1`;
+      const rootPrompt = "Run the secret cut fixture.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_cut_first"')) {
+          return toolCall(first, {}, "trace_cut_first");
+        }
+        if (!body.includes('"toolCallId":"trace_cut_second"')) {
+          return toolCall(second, {}, "trace_cut_second");
+        }
+        return finalText("cuts done");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("cuts done", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+
+      for (const record of records) {
+        expect(JSON.stringify(record)).not.toContain("AAAAAA");
+      }
+
+      // Both cuts happened, and the whole tokens they left are masked.
+      const failed = records.filter((record) => record.type === "failed_tool_call");
+      expect(failed.map((record) => record.call_id)).toEqual(["trace_cut_first", "trace_cut_second"]);
+      for (const record of failed) {
+        expect(record.args_omitted_bytes as number).toBeGreaterThan(0);
+        expect(record.result_omitted_bytes as number).toBeGreaterThan(0);
+        expect(JSON.stringify(record)).toContain("[redacted]");
+      }
+      const window = records.filter((record) => record.type === "tool_call");
+      for (const id of ["trace_cut_first", "trace_cut_second"]) {
+        const call = window.find((record) => record.call_id === id);
+        if (call) expect(call.args_bytes as number).toBeGreaterThan(1200);
+      }
+
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps no part of a secret that the screen wraps",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // Fake secrets wider than the 50-column screen, so fx wraps each one
+      // across rows: in command output, in prose, and in a table cell. Each
+      // place has its own secret, and each secret has its own letter, so no
+      // piece of one secret can match another place's value.
+      const token = "ghp_" + "A".repeat(80);
+      const bearer = "Bearer " + "D".repeat(80);
+      const assignment = "API_KEY=" + "E".repeat(80);
+      const proseToken = "sk-" + "B".repeat(80);
+      const tableToken = "github_pat_" + "C".repeat(80);
+      const runs = ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"];
+      const rootPrompt = "Run the wrapped secret fixture.";
+      const answer = [
+        `The token is ${proseToken} here.`,
+        "",
+        "| name | value |",
+        "| --- | --- |",
+        `| key | ${tableToken} |`,
+        "",
+        "wrapped secrets done",
+      ].join("\n");
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_wrap_echo"')) {
+          return toolCall(
+            `echo '${token}'; echo 'Authorization: ${bearer}'; echo '${assignment}'`,
+            {},
+            "trace_wrap_echo",
+          );
+        }
+        return finalText(answer);
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 50,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("wrapped secrets done", 120_000);
+      // The prose and the table are on screen in pieces: no row holds a whole
+      // secret. The command output is folded once the turn ends, and its
+      // entries keep the rows it was wrapped into.
+      const screen = await activeSession.capturePane();
+      expect(runs.some((run) => screen.includes(run))).toBe(true);
+      for (const secret of [token, bearer, assignment, proseToken, tableToken]) {
+        expect(screen).not.toContain(secret);
+      }
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+
+      const renderer = records.find((record) => record.type === "renderer_state") as
+        | { shadow_grid?: { visible_rows?: Array<{ row: number; text: string }> } }
+        | undefined;
+      const rows = renderer?.shadow_grid?.visible_rows ?? [];
+      expect(rows.length).toBeGreaterThan(0);
+      for (const run of runs) {
+        const leaks = rows.filter((row) => row.text.includes(run)).map((row) => row.text);
+        expect(leaks).toEqual([]);
+      }
+      for (const record of records) {
+        for (const run of runs) {
+          expect(JSON.stringify(record)).not.toContain(run);
+        }
+      }
+      // Ordinary screen text stays.
+      const shown = rows.map((row) => row.text).join("\n");
+      expect(shown).toContain("wrapped secrets done");
+      expect(shown).toContain("name");
+      expect(shown).toContain("The token is");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace writes every screen row as redacted past 1024 secrets",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // More distinct secrets than the trace keeps (1024). Each is "ghp_" and
+      // 36 characters: the index in base 36, padded with A's, so none repeats.
+      const tokens = Array.from({ length: 1100 }, (_, index) =>
+        "ghp_" + index.toString(36).padStart(36, "A"),
+      );
+      const rootPrompt = "Print the many secrets fixture.";
+      const answer = [...tokens, "many secrets done"].join("\n");
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        return finalText(answer);
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 80,
+        height: 30,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("many secrets done", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+
+      const renderer = records.find((record) => record.type === "renderer_state") as
+        | { shadow_grid?: { visible_rows?: Array<{ row: number; text: string }> } }
+        | undefined;
+      const rows = renderer?.shadow_grid?.visible_rows ?? [];
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.filter((row) => row.text !== "[redacted]")).toEqual([]);
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps no part of a secret in command output while the command runs",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The command prints a token wider than the screen, then waits for the
+      // gate file this test creates after /trace, so /trace runs while its
+      // output is still live however slow the runner is.
+      const tail = "A".repeat(80);
+      const token = "ghp_" + tail;
+      const gate = join(root.workspace, "trace-go");
+      const rootPrompt = "Run the long secret command.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_running_echo"')) {
+          return toolCall(
+            `echo '${token}'; while [ ! -e '${gate}' ]; do sleep 0.1; done`,
+            {},
+            "trace_running_echo",
+          );
+        }
+        return finalText("running done");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 50,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("AAAAAA", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const records = readFileSync(latestTraceReportPath(root.root), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { type: string; [field: string]: unknown });
+      for (const record of records) {
+        expect(JSON.stringify(record)).not.toContain("AAAAAA");
+      }
+
+      // A turn was live when /trace ran, and the call had no finished tool_call
+      // record yet. The trace has no record that names an in-flight call by its
+      // call_id, so the finished-call record is the one this checks is absent.
+      expect(
+        records.some(
+          (record) => record.type === "problem" && record.kind === "active_turn" && record.processing === true,
+        ),
+      ).toBe(true);
+      expect(
+        records.filter((record) => record.type === "tool_call" && record.call_id === "trace_running_echo"),
+      ).toEqual([]);
+      // The live output was on screen, and its rows are written as [redacted].
+      const renderer = records.find((record) => record.type === "renderer_state") as
+        | { shadow_grid?: { visible_rows?: Array<{ row: number; text: string }> } }
+        | undefined;
+      const rows = renderer?.shadow_grid?.visible_rows ?? [];
+      expect(rows.some((row) => row.text.includes("[redacted]"))).toBe(true);
+
+      // The checks above ran while the command waited, so let it finish now.
+      writeFileSync(gate, "");
+      await activeSession.waitForText("running done", 120_000);
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI trace says why the shell snapshot capture failed",
     async () => {
       const configuredShell = userInfo().shell ?? "";
@@ -2522,6 +2935,151 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace carries the crash report fx saved when it last ended on an error",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "trace-crash-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // The file `writeCrashReport` saves when fx ends on an error: the trace
+      // header, the fatal error, and one record from the session. It is dated an
+      // hour ago, because `/trace` shows a crash report only within 24 hours of it.
+      const crashAtMs = Date.now() - 60 * 60 * 1000;
+      const crashAt = new Date(crashAtMs).toISOString();
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-crash.jsonl"),
+        [
+          JSON.stringify({
+            type: "fx_trace",
+            format_version: 1,
+            fx_version: "9.9.9",
+            git_commit: "abc1234",
+            written_at: crashAt,
+            written_at_ms: crashAtMs,
+            notice: "private",
+          }),
+          JSON.stringify({
+            type: "fatal_error",
+            error: "InvalidTranscriptTransition",
+            message: "invalid transcript transition",
+            at: crashAt,
+            at_ms: crashAtMs,
+          }),
+          JSON.stringify({ type: "renderer_event", sequence: 1, kind: "commit", detail: "ok" }),
+        ].map((line) => `${line}\n`).join(""),
+      );
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "InvalidTranscriptTransition",
+        message: "invalid transcript transition",
+        fx_version: "9.9.9",
+        git_commit: "abc1234",
+        records: 3,
+        skipped: 0,
+      });
+      expect(
+        report.all("last_crash_record").map((record) => (record.record as { type: string }).type),
+      ).toEqual(["fx_trace", "fatal_error", "renderer_event"]);
+      // The live report is not a crash report, so it has no fatal_error record of its own.
+      expect(report.all("fatal_error")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a segfault as a crash report that the next /trace shows",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "segfault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+      const start = () =>
+        TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { PATH: hostilePath(root), TMPDIR: tmpDir }),
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+
+      // The signal goes to the one process the tmux pane runs, found the way the
+      // other terminal tests find it. The check first confirms that process is fx.
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      const fxPid = activeSession.processPid();
+      expect(
+        execFileSync("ps", ["-ww", "-o", "args=", "-p", String(fxPid)], { encoding: "utf8" }),
+      ).toContain(FX_BIN);
+      process.kill(fxPid, "SIGSEGV");
+      expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
+      // Zig's handler ends in abort(), so fx exits with 128 + SIGABRT (6).
+      expect(activeSession.recordedExitStatus()).toBe(134);
+      await activeSession.kill();
+      activeSession = null;
+
+      // Zig's default output still names the signal before the process aborts.
+      expect(readFileSync(stderrPath, "utf8")).toContain("Segmentation fault");
+      const crashPath = join(root.home, ".fx", "diagnostics", "last-crash.jsonl");
+      expect(statSync(crashPath).mode & 0o777).toBe(0o600);
+      const lines = readFileSync(crashPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines[0]).toMatchObject({ type: "fx_trace" });
+      expect(lines[1]).toMatchObject({
+        type: "fatal_error",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
     async () => {
       const root = createIsolatedRoot();
@@ -2858,14 +3416,14 @@ describe("effect-aware command permissions", () => {
           expect(fixture.tcsetpgrp_attempted).toBe(false);
           expect(fixture.tcsetpgrp_succeeded).toBe(false);
           foregroundFxRow(ttyPath, binary);
-          process.kill(fixture.pid, 0);
+          expect(processAlive(fixture.pid)).toBe(true);
 
           // `exec` drops out of the short form; the script's name stays.
           await activeSession.waitForText("Running python3 terminal-session-fixture.py", TIMEOUT);
           await activeSession.sendLiteralText("q");
           await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
-          process.kill(fixture.pid, 0);
+          expect(processAlive(fixture.pid)).toBe(true);
           await activeSession.sendKeys("C-u");
         } finally {
           writeFileSync(releasePath, "release\n");
@@ -4642,12 +5200,295 @@ describe("effect-aware command permissions", () => {
     },
     TIMEOUT,
   );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace shows the workspace's git state, the settings that are set, and the skills",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The repository is made with the real git; fx must not run the
+      // hostile git that PATH puts first.
+      const git = (...args: string[]) => {
+        const result = Bun.spawnSync(["git", ...args], {
+          cwd: root.workspace,
+          env: { ...process.env, HOME: root.home, GIT_CONFIG_NOSYSTEM: "1" },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        expect(result.exitCode, result.stderr.toString()).toBe(0);
+      };
+      git("init", "-q", "-b", "feature/trace-probe");
+      git("config", "user.name", "Example");
+      git("config", "user.email", "example@example.com");
+      writeFileSync(join(root.workspace, "tracked.txt"), "one\n");
+      git("add", "tracked.txt");
+      git("commit", "-q", "-m", "Add tracked file");
+      writeFileSync(join(root.workspace, "tracked.txt"), "two\n");
+      writeFileSync(join(root.workspace, "new-file.txt"), "new\n");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: {},
+          collapse_tool_calls: false,
+          workspaces: { [root.workspace]: { auto_compact_percent: 50 } },
+        }),
+      );
+      writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ max_agent_steps: 40 }));
+      const skillDir = join(root.workspace, ".agents", "skills", "trace-probe");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, "SKILL.md"), "---\nname: trace-probe\ndescription: A skill the trace lists\n---\n\nbody\n");
+
+      const gateway = startDynamicFakeGateway(async () => finalText("setup traced"));
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say hello.");
+      await activeSession.waitForText("setup traced", TIMEOUT);
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readTraceReport(latestTraceReportPath(root.root));
+
+      // Each line git printed is one string, so a file name with a line break
+      // or an escape byte stays inside it, as git quotes it.
+      const gitRecord = report.one("git");
+      expect(gitRecord).toMatchObject({ repository: true, branch: "feature/trace-probe" });
+      const status = gitRecord.status as string[];
+      expect(status[0]).toBe("## feature/trace-probe");
+      expect(status).toContain(" M tracked.txt");
+      expect(status).toContain("?? new-file.txt");
+      expect(status).toContain('?? "line\\nname"');
+      expect(status.join("\n")).not.toContain("\x1b");
+      expect(gitRecord.commits).toEqual([expect.stringMatching(/^[0-9a-f]+ Add tracked file$/)]);
+      expect(gitRecord.staged).toBeUndefined();
+      expect(gitRecord.unstaged).toEqual([expect.stringMatching(/^ tracked\.txt \| 2 \+-$/), expect.stringMatching(/^ 1 file changed/)]);
+      expect(report.text).not.toContain("\x1b");
+      expect(existsSync(root.commandMarkers.git!)).toBe(false);
+
+      // Settings from ~/.fx/settings.json, its override for this workspace,
+      // .fx.json, and FX_MODEL.
+      const settings = report.all("setting");
+      const described = settings.map((setting) =>
+        `${setting.origin}${setting.variable === undefined ? "" : `:${setting.variable}`} ${setting.key}=${setting.value}`);
+      expect(described).toEqual(expect.arrayContaining([
+        "global collapse_tool_calls=false",
+        "workspace auto_compact_percent=50",
+        "project max_agent_steps=40",
+        `env:FX_MODEL models.gateway=${MODEL}`,
+      ]));
+      expect(settings.find((setting) => setting.key === "auto_compact_percent")).toMatchObject({
+        file: expect.stringMatching(/settings\.json$/),
+        workspace: root.workspace,
+      });
+      expect(settings.find((setting) => setting.key === "max_agent_steps")).toMatchObject({ file: ".fx.json" });
+      expect(report.one("settings")).toMatchObject({ set: settings.length, unknown_keys: 0 });
+
+      expect(report.all("skill")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "trace-probe", source: "workspace .agents/skills" }),
+      ]));
+      expect(report.one("skills").found).toBe(report.all("skill").length);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  // A repository with one empty commit whose index is a FIFO that nothing
+  // writes: `git status` and `git diff` wait on it for good, while `git log`
+  // and `git branch` do not read it. Returns the FIFO's path.
+  function makeFifoIndexRepo(root: IsolatedRoot): string {
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(["git", ...args], {
+        cwd: root.workspace,
+        env: { ...process.env, HOME: root.home, GIT_CONFIG_NOSYSTEM: "1" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+    };
+    git("init", "-q", "-b", "feature/fifo-probe");
+    git("-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-q", "--allow-empty", "-m", "Add nothing");
+    const index = join(root.workspace, ".git", "index");
+    rmSync(index, { force: true });
+    execFileSync("mkfifo", [index]);
+    return index;
+  }
+
+  // Lets any reader blocked on the FIFO go, so a failed run leaves no git
+  // behind: opening it for reading and writing never waits, and closing it
+  // gives the reader the end of the file.
+  function releaseFifoReaders(path: string) {
+    try {
+      execFileSync("/bin/sh", ["-c", ': <>"$1"', "sh", path], { stdio: "ignore", timeout: 2_000 });
+    } catch {}
+  }
+
+  // The safe git commands `parent` started that still run, by process ID.
+  function safeGitChildren(parent: number, pattern = "no-optional-locks"): number[] {
+    try {
+      return execFileSync("pgrep", ["-P", String(parent), "-f", pattern], { encoding: "utf8" })
+        .split("\n")
+        .filter(Boolean)
+        .map(Number);
+    } catch {
+      return [];
+    }
+  }
+
+  async function startFifoTraceSession(root: IsolatedRoot, stderrPath: string) {
+    const gateway = startDynamicFakeGateway(async (body) =>
+      finalText(currentUserText(body).includes("again") ? "answered after trace" : "answered before trace"));
+    activeSession = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: root.workspace,
+      env: gatewayEnv(root, gateway, {
+        PATH: hostilePath(root),
+        TMPDIR: root.root,
+        FX_TRACE: "0",
+        FX_TRACE_LOG: undefined,
+        FX_TRACE_STDERR: "0",
+      }),
+      stderrPath,
+      width: 120,
+      height: 40,
+    });
+    await activeSession.waitForComposer(TIMEOUT);
+    await activeSession.sendText("Say hello.");
+    await activeSession.waitForText("answered before trace", TIMEOUT);
+    return activeSession;
+  }
+
+  // Waits for the trace that `/trace` writes, and says what fx printed to
+  // stderr when none comes.
+  async function waitForFifoTrace(root: IsolatedRoot, before: Set<string>, stderrPath: string) {
+    return waitForNewTraceReport(root.root, before, 10_000).catch((error: Error) => {
+      throw new Error(`${error.message}\nfx stderr:\n${readFileSync(stderrPath, "utf8")}`);
+    });
+  }
+
+  async function expectFxStillAnswers(session: TmuxSession, stderrPath: string) {
+    await session.sendText("Say hello again.");
+    await session.waitForText("answered after trace", TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd()).toBe(true);
+    await session.kill();
+    activeSession = null;
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace stops waiting for git at its limit and keeps answering",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const index = makeFifoIndexRepo(root);
+      try {
+        const session = await startFifoTraceSession(root, stderrPath);
+        const before = new Set(traceReportNames(root.root));
+        const started = Date.now();
+        await session.sendText("/trace");
+        const report = await waitForFifoTrace(root, before, stderrPath);
+        // The limit is 3 s in all; SIGTERM then ends the git that waits.
+        expect(Date.now() - started).toBeLessThan(8_000);
+
+        const gitRecord = report.one("git");
+        expect(gitRecord).toMatchObject({
+          error: "timeout",
+          timeout_ms: 3000,
+          unfinished: { status: "timeout", staged: "timeout", unstaged: "timeout" },
+          repository: true,
+          branch: "feature/fifo-probe",
+        });
+        expect(gitRecord.commits).toEqual([expect.stringMatching(/^[0-9a-f]+ Add nothing$/)]);
+        expect(gitRecord.status).toBeUndefined();
+        expect(gitRecord.signal).toBeUndefined();
+        // fx reaped the git it ended, and the hostile git on PATH never ran.
+        expect(safeGitChildren(session.processPid())).toEqual([]);
+        expect(existsSync(root.commandMarkers.git!)).toBe(false);
+        await expectFxStillAnswers(session, stderrPath);
+      } finally {
+        releaseFifoReaders(index);
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace reports a git command that a signal ended and keeps answering",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const index = makeFifoIndexRepo(root);
+      try {
+        const session = await startFifoTraceSession(root, stderrPath);
+        const fx = session.processPid();
+        const before = new Set(traceReportNames(root.root));
+        await session.sendText("/trace");
+        // Each git status or diff that waits on the index is killed as soon as
+        // it starts, until the trace is written.
+        const killed: number[] = [];
+        let tracing = true;
+        const killer = (async () => {
+          while (tracing) {
+            for (const pid of safeGitChildren(fx, "no-optional-locks.* (status|diff) ")) {
+              try {
+                process.kill(pid, "SIGKILL");
+                killed.push(pid);
+              } catch {}
+            }
+            await Bun.sleep(20);
+          }
+        })();
+        const report = await waitForFifoTrace(root, before, stderrPath).finally(async () => {
+          tracing = false;
+          await killer;
+        });
+
+        expect(killed.length).toBeGreaterThan(0);
+        const gitRecord = report.one("git");
+        expect(gitRecord).toMatchObject({ signal: 9, repository: true, branch: "feature/fifo-probe" });
+        // A kill the loop missed leaves that command to the time limit.
+        expect(["signal", "timeout"]).toContain(gitRecord.error as string);
+        expect((gitRecord.unfinished as Record<string, string>).status).toBe("signal");
+        expect(gitRecord.commits).toEqual([expect.stringMatching(/^[0-9a-f]+ Add nothing$/)]);
+        expect(safeGitChildren(fx)).toEqual([]);
+        await expectFxStillAnswers(session, stderrPath);
+      } finally {
+        releaseFifoReaders(index);
+      }
+    },
+    TIMEOUT * 2,
+  );
 });
 
 class AcpClient {
   private buffer = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private closed = false;
   private stderrChunks: Buffer[] = [];
   private activeSessionId: string | null = null;
@@ -4659,9 +5500,7 @@ class AcpClient {
       this.buffer = parts.pop() ?? "";
       for (const line of parts) {
         if (!line.trim()) continue;
-        const waiter = this.waiters.shift();
-        if (waiter) waiter(line);
-        else this.lines.push(line);
+        this.queue.push(line);
       }
     });
     proc.stderr!.on("data", (chunk: Buffer) => this.stderrChunks.push(chunk));
@@ -4703,18 +5542,7 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
-    const line = await new Promise<string>((resolve, reject) => {
-      const buffered = this.lines.shift();
-      if (buffered) {
-        resolve(buffered);
-        return;
-      }
-      const timer = setTimeout(() => reject(new Error("ACP read timeout")), timeoutMs);
-      this.waiters.push((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      });
-    });
+    const line = await this.queue.next(timeoutMs, () => new Error("ACP read timeout"));
     const message = JSON.parse(line);
     if (message.method === "session/request_permission" && message.id !== undefined) {
       this.send({
@@ -4773,3 +5601,18 @@ async function runAcpPrompt(client: AcpClient, text: string) {
     messages.push(message);
   }
 }
+
+describe("the ACP test client's reader", () => {
+  test("a read that timed out does not take the next line", async () => {
+    // A stand-in for `fx acp`: no fx runs.
+    const proc = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      stdin: { write() {} },
+    });
+    const client = new (AcpClient as any)(proc);
+    await expect(client.readLine(30)).rejects.toThrow("ACP read timeout");
+    proc.stdout.emit("data", Buffer.from(`${JSON.stringify({ id: 7, result: {} })}\n`));
+    expect(await client.readLine(500)).toEqual({ id: 7, result: {} });
+  });
+});

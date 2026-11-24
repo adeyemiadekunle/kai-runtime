@@ -104,11 +104,18 @@ pub const ConversationToolResult = struct {
     command_replay_bytes: ?u64 = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     terminal_action_presentation: ?types.TerminalActionPresentation = null,
+    /// Never in the piece, which an older fx reads strictly: a v2 session
+    /// saves it as a `subagent_started` item right after it (D101).
+    subagent_started: bool = false,
 
     pub fn jsonStringify(self: ConversationToolResult, writer: *std.json.Stringify) !void {
         try writer.beginObject();
         inline for (@typeInfo(ConversationToolResult).@"struct".field_names) |field_name| {
-            if (!std.mem.eql(u8, field_name, "review_feedback") or self.review_feedback) {
+            const written = if (comptime std.mem.eql(u8, field_name, "subagent_started"))
+                false
+            else
+                !std.mem.eql(u8, field_name, "review_feedback") or self.review_feedback;
+            if (written) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }
@@ -126,6 +133,11 @@ pub const ConversationInterruption = struct {
     files: []const types.FileEvidence = &.{},
     turn_summary: ?types.TurnSummary = null,
     cancellation_origin: types.CancellationOrigin = .turn,
+    /// The call of a command the turn cancelled when the piece names none of
+    /// its output, so that only this says the command ran. The piece never
+    /// holds it: a v2 session saves it as a `cancelled_command` item of its
+    /// own right before the piece, which older fx versions skip (D100).
+    cancelled_command_call_id: ?[]const u8 = null,
 
     pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ConversationInterruption {
         const Wire = struct {
@@ -625,10 +637,21 @@ pub fn appendHistoryTurnConversationEvents(
                     null,
                 .files = entry.execution.files,
                 .turn_summary = entry.execution.turn_summary,
+                .cancelled_command_call_id = cancelledCommandWithoutOutput(entry),
             } });
         },
         .compacted_summary => return error.ConversationCheckpointRequiresSequence,
     }
+}
+
+/// The call of `entry`'s cancelled command when its interruption piece names
+/// neither a command replay nor an artifact, such as a command cancelled
+/// before it printed anything; null otherwise (D100).
+fn cancelledCommandWithoutOutput(entry: types.InterruptedHistoryTurn) ?[]const u8 {
+    const presentation = entry.cancelled_command orelse return null;
+    const call = entry.tool_call orelse return null;
+    if (interruptedCommandReplayRef(entry) != null or presentation.command_artifact_handle != null) return null;
+    return call.id;
 }
 
 fn interruptedCommandReplayRef(
@@ -721,6 +744,7 @@ pub fn appendExecutionConversationEvents(
                 .command_replay_bytes = resultCommandReplayBytes(result),
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
+                .subagent_started = result.subagent_started,
             } });
         }
         const completed_steps = step_index + 1;

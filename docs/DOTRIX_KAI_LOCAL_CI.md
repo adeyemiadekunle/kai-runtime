@@ -105,3 +105,22 @@ Hosted CI still has to run the macOS and arm64 addons (`test:node-napi` on each)
 | Dotrix's coding and CLI suites | 264 passed, 24 skipped |
 
 Not run: `docker build` of the coding image (no Docker daemon here), and the arm64 binary.
+
+## kai-runtime upstream sync (`adeyemiadekunle/kai@170f50e4`)
+
+Synced `sync/upstream-170f50e4` from `origin/main` (`2ee91382`) with `upstream/main` (`170f50e4`, 931 commits ahead of fork base `d1d4a883`), resolving conflicts in `AGENTS.md`, `scripts/pgso/tests/test_corpus.py`, `src/core/cli/cli_config.zig`, and `src/core/subagent/tool_host.zig` (adding `.too_many_subagents` to `src/core/subagent/refusal.zig`).
+
+Platform and toolchain: macOS arm64, Zig 0.17.1, Bun 1.4.5, Node v26.13.1, Python 3.
+
+| Step | Result |
+| --- | --- |
+| `git diff --check` and `zig fmt --check src/` | Passed |
+| Boundary and surface guards (`compactor`, `indexer`, `recovery`, `agents`, `public-surface`) | Passed |
+| `python3 -m unittest scripts/pgso/tests/test_corpus.py` | Passed (`38` tests, `76` candidate scenarios) |
+| `zig build`, N-API addon (`ReleaseSafe`), WASM core and term (`ReleaseSmall`) | Passed |
+| `zig build test` | Passed (exit `0`) |
+| Built `./zig-out/bin/fx` smoke (`version` and `project_config` default and override) | Passed (`0.0.17`, `true`, `false`, clean stderr) |
+| E2E: `tests/e2e/project-config.test.ts` and `tests/e2e/acp.test.ts` | `299` passed, `14` skipped (live-model cases), `0` failed |
+| SDK: `test-journal.mjs`, `test-agent-correlation.mjs`, `test-node-napi.mjs`, `test-node-package.mjs` | Passed |
+
+Outstanding for hosted CI: Linux x64/arm64 builds and ABI checks, macOS arm64 hosted CI lane, remaining E2E corpus files, TLA+ workflows, WASM browser/Node JSPI suites, and live-model tests.

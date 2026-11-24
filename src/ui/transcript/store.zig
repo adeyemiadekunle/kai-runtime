@@ -21,6 +21,7 @@ const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
+const theme_retint = @import("../../core/shared/theme_retint.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -680,32 +681,25 @@ fn statusGeometryUnchanged(cols: u16, previous: []const u8, next: []const u8) bo
     return next_lines.next() == null;
 }
 
-fn hasCommittedRetentionSource(self: anytype) bool {
-    if (comptime @hasDecl(@TypeOf(self.*), "committedRetentionIdentity")) {
-        const identity = self.committedRetentionIdentity() orelse return false;
-        return identity.lines.len > 0 and self.retentionSourceCols() != null;
-    }
-    return false;
-}
-
 /// Removes the entries the transcript window dropped (`transcript_window_shell.zig`),
 /// with the same cleanup the byte-cap retention runs after it prunes. Ids no
 /// longer present are skipped; a pinned entry is never removed.
+/// With a `transcript_commit_state`, the drop runs on a copy and commits only when every step succeeds, so a failed allocation leaves the transcript and its entries as they were.
 pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     if (ids.len == 0) return false;
     if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
-        if (hasCommittedRetentionSource(self)) {
-            var shadow = try cloneRecordedMutationState(self, alloc);
-            defer shadow.deinit(alloc);
-            const changed = try dropEntries(&shadow, alloc, ids);
-            if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
-            return changed;
-        }
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        const changed = try dropEntries(&shadow, alloc, ids);
+        if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
+        return changed;
     }
     return dropEntries(self, alloc, ids);
 }
 
-fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
+/// Drops in place, so a failed allocation can leave the runtime half changed.
+/// Outside `dropEntriesAtomic`, call it only when the caller discards the runtime on failure.
+pub fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
     try rebuildEntryIdSet(self, alloc, &entry_ids);
@@ -770,6 +764,8 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
         if (self.transcript_window) |*window| window.reset(alloc);
         if (comptime @hasDecl(@TypeOf(self.*), "discardTranscriptArchive")) self.discardTranscriptArchive();
     }
+    // This call frees every entry, so the hold ends here, with or without a window.
+    if (comptime @hasField(@TypeOf(self.*), "unpainted_resume_hold")) self.unpainted_resume_hold = false;
     for (self.notebook.folded_command_blocks.items) |*block| block.deinit(alloc);
     self.notebook.folded_command_blocks.clearRetainingCapacity();
     for (self.notebook.command_output_blocks.items) |*block| block.deinit(alloc);
@@ -1998,12 +1994,62 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_output_replay = command_output_replay,
         .command_process_presentation = source.command_process_presentation,
         .outcome = source.outcome,
+        .streaming = source.streaming,
         .fallback_disposition = source.fallback_disposition,
         .origin = source.origin,
         .lifecycle_id = lifecycle_id,
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
+        .subagent_report = source.subagent_report,
+        .check_found_command_ended = source.check_found_command_ended,
+        .subagent_started = source.subagent_started,
     };
+}
+
+test "a snapshot copy of a tool detail keeps its subagent report mark" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |marked| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 3,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{}"),
+            .subagent_report = marked,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(marked, copy.subagent_report);
+    }
+}
+
+test "a snapshot copy of a shell check keeps whether it found its command ended" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |ended| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-1\"}"),
+            .outcome = .completed,
+            .check_found_command_ended = ended,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(ended, copy.check_found_command_ended);
+    }
+}
+
+test "a snapshot copy of a tool detail keeps its subagent start mark" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |started| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}"),
+            .subagent_started = started,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(started, copy.subagent_started);
+    }
 }
 
 fn cloneCommandLines(
@@ -2440,28 +2486,16 @@ pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
     return entry_id;
 }
 
-/// Takes ownership of `table` only when it returns successfully.
-pub fn appendAssistantTableOwned(
+/// Changes the runtime in place, so a failed allocation can leave the transcript
+/// showing an entry the notebook no longer holds. Only `appendAssistantBlockAtomic` calls it.
+fn appendAssistantBlockInPlace(
     self: anytype,
     alloc: Allocator,
-    table: assistant_presentation.TablePayload,
+    entry: TranscriptEntry,
+    rebuild_reason: []const u8,
 ) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantTableOwned(&shadow, alloc, table);
-        errdefer {
-            _ = shadow.notebook.entries.pop();
-        }
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_table_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_table = .{
-        .id = entry_id,
-        .created_at_ms = io_mod.milliTimestamp(),
-        .table = table,
-    } });
+    const entry_id = entry.id();
+    try self.notebook.entries.append(alloc, entry);
     errdefer {
         _ = self.notebook.entries.pop();
     }
@@ -2473,11 +2507,48 @@ pub fn appendAssistantTableOwned(
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_table");
+    try rebuildTranscriptFromRendered(self, alloc, rendered, rebuild_reason);
     try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
     self.notebook.next_entry_id +%= 1;
     return entry_id;
+}
+
+/// With a `transcript_commit_state`, appends on a copy and commits only when every step succeeds,
+/// so a failed allocation leaves the transcript and its entries as they were. The caller keeps the payload on error.
+fn appendAssistantBlockAtomic(
+    self: anytype,
+    alloc: Allocator,
+    entry: TranscriptEntry,
+    commit_reason: []const u8,
+    rebuild_reason: []const u8,
+) !u32 {
+    if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        const id = try appendAssistantBlockInPlace(&shadow, alloc, entry, rebuild_reason);
+        errdefer {
+            // The caller still owns the payload when the commit fails, so the copy must drop the entry before it is freed.
+            _ = shadow.notebook.entries.pop();
+        }
+        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, commit_reason, .preserve_same_epoch);
+        return id;
+    }
+    return appendAssistantBlockInPlace(self, alloc, entry, rebuild_reason);
+}
+
+/// Takes ownership of `table` only when it returns successfully.
+pub fn appendAssistantTableOwned(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+) !u32 {
+    const entry: TranscriptEntry = .{ .assistant_table = .{
+        .id = self.notebook.next_entry_id,
+        .created_at_ms = io_mod.milliTimestamp(),
+        .table = table,
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_table_append", "append_assistant_table");
 }
 
 /// Takes ownership of `block` only when it returns successfully.
@@ -2486,69 +2557,20 @@ pub fn appendAssistantCodeBlockOwned(
     alloc: Allocator,
     block: assistant_presentation.CodeBlockPayload,
 ) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantCodeBlockOwned(&shadow, alloc, block);
-        errdefer {
-            _ = shadow.notebook.entries.pop();
-        }
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_code_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_code_block = .{
-        .id = entry_id,
+    const entry: TranscriptEntry = .{ .assistant_code_block = .{
+        .id = self.notebook.next_entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .block = block,
-    } });
-    errdefer {
-        _ = self.notebook.entries.pop();
-    }
-
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_code_block");
-    try pruneOrphanedCommandState(self, alloc);
-    requestTranscriptPaint(self);
-    self.notebook.next_entry_id +%= 1;
-    return entry_id;
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_code_append", "append_assistant_code_block");
 }
 
 pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantThematicRule(&shadow, alloc);
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_rule_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_thematic_rule = .{
-        .id = entry_id,
+    const entry: TranscriptEntry = .{ .assistant_thematic_rule = .{
+        .id = self.notebook.next_entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
-    } });
-    errdefer {
-        _ = self.notebook.entries.pop();
-    }
-
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_thematic_rule");
-    try pruneOrphanedCommandState(self, alloc);
-    requestTranscriptPaint(self);
-    self.notebook.next_entry_id +%= 1;
-    return entry_id;
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_rule_append", "append_assistant_thematic_rule");
 }
 
 pub fn lookupAssistantSegments(self: anytype, id: u32) ?*AssistantTurnSegments {
@@ -2698,6 +2720,8 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
             .activity_kind = .command,
             .arguments_json = "{\"command\":\"printf committed\"}",
         } });
+        // Core names the call right after it starts; until then it has no row.
+        _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running printf committed" } });
         try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, .{}, id, .stdout, "COMMITTED_RAW\n", true);
     } else {
         _ = try runtime.appendRawTranscriptEntryClassified(alloc, "COMMITTED_RAW", .unknown_raw);
@@ -2958,8 +2982,8 @@ pub fn retintEntriesForTheme(
     if (from.light == to.light) return;
     try self.assertCanMutateTranscript();
 
-    var token_buf: [theme_retint_field_count]ThemeToken = undefined;
-    const tokens = retintTokens(from, to, &token_buf);
+    var token_buf: [theme_retint.max_tokens]theme_retint.Token = undefined;
+    const tokens = theme_retint.tokens(from, to, &token_buf);
     if (tokens.len == 0) return;
 
     var shadow = try cloneMutationState(self, alloc);
@@ -2969,18 +2993,29 @@ pub fn retintEntriesForTheme(
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
-                if (try retintThemeBytes(alloc, raw.bytes, tokens)) |replacement| {
+                if (try theme_retint.rewrite(alloc, raw.bytes, tokens)) |replacement| {
                     alloc.free(raw.bytes);
                     raw.bytes = replacement;
                 }
             },
             .assistant_turn => |*assistant| {
-                if (try retintThemeBytes(alloc, assistant.segments.text.items, tokens)) |replacement| {
+                if (try theme_retint.rewrite(alloc, assistant.segments.text.items, tokens)) |replacement| {
                     assistant.segments.text.deinit(alloc);
                     assistant.segments.text = .fromOwnedSlice(replacement);
                 }
             },
-            .semantic_notice, .user_turn, .assistant_table, .assistant_code_block, .assistant_thematic_rule => {},
+            // Cells hold inline code and links drawn in the theme of the
+            // moment the table finished.
+            .assistant_table => |*assistant| for (assistant.table.rows) |row| {
+                for (row.cells) |*cell| {
+                    if (try theme_retint.rewrite(alloc, cell.*, tokens)) |replacement| {
+                        alloc.free(cell.*);
+                        cell.* = replacement;
+                    }
+                }
+            },
+            // Drawn from their source when painted, in the active theme.
+            .semantic_notice, .user_turn, .assistant_code_block, .assistant_thematic_rule => {},
         }
     }
 
@@ -2997,29 +3032,6 @@ pub fn retintEntriesForTheme(
     );
 }
 
-const ThemeToken = struct {
-    from: []const u8,
-    to: []const u8,
-};
-
-const dark_to_light_theme_tokens = [_]ThemeToken{
-    .{ .from = "\x1b[1;38;5;255m", .to = "\x1b[1;38;5;235m" },
-    .{ .from = "\x1b[38;5;255m", .to = "\x1b[38;5;235m" },
-    .{ .from = "\x1b[1;38;5;252m", .to = "\x1b[1;38;5;238m" },
-    .{ .from = "\x1b[38;5;252m", .to = "\x1b[38;5;238m" },
-    .{ .from = "\x1b[38;5;250m", .to = "\x1b[38;5;241m" },
-    .{ .from = "\x1b[38;5;245m", .to = "\x1b[38;5;247m" },
-};
-
-const light_to_dark_theme_tokens = [_]ThemeToken{
-    .{ .from = "\x1b[1;38;5;235m", .to = "\x1b[1;38;5;255m" },
-    .{ .from = "\x1b[38;5;235m", .to = "\x1b[38;5;255m" },
-    .{ .from = "\x1b[1;38;5;238m", .to = "\x1b[1;38;5;252m" },
-    .{ .from = "\x1b[38;5;238m", .to = "\x1b[38;5;252m" },
-    .{ .from = "\x1b[38;5;241m", .to = "\x1b[38;5;250m" },
-    .{ .from = "\x1b[38;5;247m", .to = "\x1b[38;5;245m" },
-};
-
 fn themeOwnsRawEntry(class: RawEntryClass) bool {
     return switch (class) {
         .welcome,
@@ -3032,119 +3044,6 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         => true,
         .command_output, .unknown_raw => false,
     };
-}
-
-/// Build the escape rewrite map between two themes. Builtin-to-builtin flips
-/// keep the hand-pinned token table; any custom theme involved gets a dynamic
-/// map pairing every slot's old escape with its new one, longest first so
-/// combined forms match before their fg-only equivalents.
-fn retintTokens(
-    from: shared_theme.Theme,
-    to: shared_theme.Theme,
-    buf: *[theme_retint_field_count]ThemeToken,
-) []const ThemeToken {
-    const from_builtin = std.mem.eql(u8, from.name, shared_theme.fx_dark.name) or std.mem.eql(u8, from.name, shared_theme.fx_light.name);
-    const to_builtin = std.mem.eql(u8, to.name, shared_theme.fx_dark.name) or std.mem.eql(u8, to.name, shared_theme.fx_light.name);
-    if (from_builtin and to_builtin) {
-        return if (to.light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
-    }
-
-    var n: usize = 0;
-    for (0..theme_retint_field_count) |index| {
-        n = appendTokenPair(
-            buf,
-            n,
-            themeRetintField(&from, index),
-            themeRetintField(&to, index),
-        );
-    }
-    sortThemeTokensLongestFirst(buf[0..n]);
-    return buf[0..n];
-}
-
-const theme_retint_field_count: usize = blk: {
-    var count: usize = 0;
-    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
-    for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
-        if (field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) count += 1;
-    }
-    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".field_types) |field_type| {
-        if (field_type == []const u8) count += 1;
-    }
-    break :blk count;
-};
-
-/// Keep field dispatch outside the admission loop so each theme slot does not
-/// expand another copy of duplicate detection and token insertion.
-noinline fn themeRetintField(theme: *const shared_theme.Theme, index: usize) []const u8 {
-    comptime var field_index: usize = 0;
-    const theme_info = @typeInfo(shared_theme.Theme).@"struct";
-    inline for (theme_info.field_names, theme_info.field_types) |field_name, field_type| {
-        if (comptime field_type == []const u8 and !std.mem.eql(u8, field_name, "name")) {
-            if (index == field_index) return @field(theme.*, field_name);
-            field_index += 1;
-        }
-    }
-    const syntax_palette_info = @typeInfo(shared_theme.SyntaxPalette).@"struct";
-    inline for (syntax_palette_info.field_names, syntax_palette_info.field_types) |field_name, field_type| {
-        if (comptime field_type == []const u8) {
-            if (index == field_index) return @field(theme.syntax, field_name);
-            field_index += 1;
-        }
-    }
-    unreachable;
-}
-
-fn appendTokenPair(buf: *[theme_retint_field_count]ThemeToken, n: usize, from: []const u8, to: []const u8) usize {
-    if (from.len == 0 or std.mem.eql(u8, from, to) or n >= buf.len) return n;
-    for (buf[0..n]) |existing| {
-        if (std.mem.eql(u8, existing.from, from)) return n;
-    }
-    buf[n] = .{ .from = from, .to = to };
-    return n + 1;
-}
-
-fn sortThemeTokensLongestFirst(tokens: []ThemeToken) void {
-    if (tokens.len < 2) return;
-    // The list is bounded by the theme's fields; a local insertion sort avoids
-    // pulling a general block-sort implementation into this cold path.
-    for (tokens[1..], 1..) |token, index| {
-        var insert_at = index;
-        while (insert_at > 0 and token.from.len > tokens[insert_at - 1].from.len) : (insert_at -= 1) {
-            tokens[insert_at] = tokens[insert_at - 1];
-        }
-        tokens[insert_at] = token;
-    }
-}
-
-fn retintThemeBytes(
-    alloc: Allocator,
-    bytes: []const u8,
-    tokens: []const ThemeToken,
-) !?[]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    var changed = false;
-    var index: usize = 0;
-    while (index < bytes.len) {
-        for (tokens) |token| {
-            if (!std.mem.startsWith(u8, bytes[index..], token.from)) continue;
-            try out.writer.writeAll(token.to);
-            index += token.from.len;
-            changed = true;
-            break;
-        } else {
-            try out.writer.writeByte(bytes[index]);
-            index += 1;
-        }
-    }
-
-    if (!changed) {
-        out.deinit();
-        return null;
-    }
-    return try out.toOwnedSlice();
 }
 
 pub fn appendReplaceableTranscriptLine(self: anytype, alloc: Allocator, metrics: *Metrics, text: []const u8) !u32 {

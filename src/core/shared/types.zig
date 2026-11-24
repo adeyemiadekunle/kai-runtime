@@ -269,6 +269,12 @@ pub const ToolLifecycleEvent = union(enum) {
         result: ?[]const u8 = null,
         result_memory: ?ToolResultMemory = null,
         command_artifact_handle: ?[]const u8 = null,
+        /// Whether the call, a shell check, found its session's command
+        /// ended, which its status does not say when the command passed
+        /// (`checkFoundCommandEnded` in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        check_found_command_ended: bool = false,
     },
     turn_finished: TurnFinished,
 };
@@ -304,9 +310,10 @@ pub const StreamState = struct {
     /// When the turn started; 0 hides the elapsed counter and activity blink.
     /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
-    /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the turn clock freezes at this instant;
-    /// on resume the wait is excluded by shifting turn_started_ms forward.
+    /// When the turn started waiting, on user input (approval or question)
+    /// or on a compaction; 0 means not waiting. While set, the turn clock
+    /// freezes at this instant; on resume the wait is excluded by shifting
+    /// turn_started_ms forward.
     waiting_since_ms: i64 = 0,
 };
 
@@ -502,13 +509,15 @@ pub const RouteRecoveryStatus = struct {
         retrying,
         need_user,
         /// The request succeeded after the module showed a status. It
-        /// carries only the attempt that succeeded. Hosts that report a
-        /// result show it; the TUI clears its status line.
+        /// carries the attempt that succeeded and the last failure fx
+        /// retried. Hosts that report a result show it; the TUI clears its
+        /// status line.
         recovered,
         /// The request ended on an error after the module showed a status,
-        /// with no terminal status of fx's own. It carries only the last
-        /// attempt; the error reaches the host its usual way. Hosts that
-        /// report a result show it; the TUI clears its status line.
+        /// with no terminal status of fx's own. It carries the last attempt
+        /// and the last failure fx retried; the error reaches the host its
+        /// usual way. Hosts that report a result show it; the TUI clears its
+        /// status line.
         failed,
         // Terminal outcomes fx reports itself.
         terminal_provider_error,
@@ -527,6 +536,12 @@ pub const RouteRecoveryStatus = struct {
     short: recovery.Text = .{},
     /// Sends of the request so far, including the first.
     attempt: usize = 0,
+    /// The kind of the last failure the recovery module handled for this
+    /// request: why it waits, resends, or needs the user. `recovered` and
+    /// `failed` keep it; the error that ends a failed request reaches the
+    /// host its usual way. Null when no send failed. Reported as `cause`;
+    /// not the same as `cause` below, the checkpoint's `ModelRecoveryCause`.
+    failure: ?recovery.Failure.Kind = null,
     cause: ?ModelRecoveryCause = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
@@ -568,15 +583,21 @@ pub const RouteRecoveryStatus = struct {
     pub const Report = struct {
         state: ReportedState,
         attempt: usize,
+        /// The status's `failure`, by its tag name.
+        cause: ?recovery.Failure.Kind = null,
         need: ?recovery.Status.Need = null,
         /// Omitted when the status has no wording: `recovered` and
-        /// `failed` report only the attempt.
+        /// `failed` report only the attempt and the cause.
         message: ?[]const u8 = null,
 
         pub fn writeJson(self: Report, writer: *std.Io.Writer) !void {
             try writer.writeAll("{\"state\":");
             try std.json.Stringify.value(@tagName(self.state), .{}, writer);
             try writer.print(",\"attempt\":{d}", .{self.attempt});
+            if (self.cause) |cause| {
+                try writer.writeAll(",\"cause\":");
+                try std.json.Stringify.value(@tagName(cause), .{}, writer);
+            }
             if (self.need) |need| {
                 try writer.writeAll(",\"need\":");
                 try std.json.Stringify.value(@tagName(need), .{}, writer);
@@ -595,6 +616,7 @@ pub const RouteRecoveryStatus = struct {
         return .{
             .state = self.reportedState(),
             .attempt = self.attempt,
+            .cause = self.failure,
             .need = self.need,
             .message = if (message.len == 0) null else message,
         };
@@ -799,6 +821,10 @@ test "recovery reports write the shape fx ask and ACP share" {
             .json = "{\"state\":\"need_user\",\"attempt\":2,\"need\":\"content_filter\",\"message\":\"Blocked by the content filter · press Esc and rephrase\"}",
         },
         .{ .status = .{ .kind = .recovered, .attempt = 3 }, .json = "{\"state\":\"recovered\",\"attempt\":3}" },
+        .{
+            .status = .{ .kind = .recovered, .attempt = 3, .failure = .rate_limited },
+            .json = "{\"state\":\"recovered\",\"attempt\":3,\"cause\":\"rate_limited\"}",
+        },
         .{ .status = .{ .kind = .failed, .attempt = 2 }, .json = "{\"state\":\"failed\",\"attempt\":2}" },
         .{
             .status = .{ .kind = .unsafe_tool_start, .attempt = 1 },
@@ -1216,6 +1242,9 @@ pub const PersistedToolResult = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// A `subagent` message that made a new subagent, which a v2 session
+    /// saves as an item of its own beside the result (D101).
+    subagent_started: bool = false,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -1380,6 +1409,9 @@ pub const ToolResultMemory = struct {
     /// the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
+    /// A `subagent` message that made a new subagent, so its row reads
+    /// "Started" rather than "Messaged". The model never sees it.
+    subagent_started: bool = false,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1522,6 +1554,79 @@ pub fn freeModelCallRecords(alloc: std.mem.Allocator, records: []const ModelCall
     alloc.free(records);
 }
 
+/// How a call a command made through `fx mcp call` ended.
+pub const BridgeCallOutcome = enum {
+    completed,
+    failed,
+    cancelled,
+
+    pub fn toolOutcome(self: BridgeCallOutcome) ToolOutcomeKind {
+        return switch (self) {
+            .completed => .completed,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        };
+    }
+};
+
+/// A call a command made through `fx mcp call`, which the TUI showed as a
+/// row in its shell call's group. The session keeps it so a resume shows
+/// that row again: the tool's name and how the call ended, never its
+/// arguments or its result. Display data, never sent to the model.
+pub const BridgeCallRecord = struct {
+    /// The shell call whose command made the call.
+    call_id: []const u8,
+    /// The bridge's id for the call.
+    request_id: []const u8,
+    tool: []const u8,
+    outcome: BridgeCallOutcome,
+};
+
+/// Whether a record may be saved and shown: each string short, valid UTF-8
+/// and free of control characters, as a model call record's are
+/// (`validModelCallText`).
+pub fn validBridgeCallRecord(record: BridgeCallRecord) bool {
+    inline for (.{ record.call_id, record.request_id, record.tool }) |text| {
+        if (!validModelCallText(text)) return false;
+    }
+    return true;
+}
+
+/// Caller owns the copy's strings; free them with `freeBridgeCallRecordStrings`.
+pub fn dupeBridgeCallRecord(alloc: std.mem.Allocator, record: BridgeCallRecord) !BridgeCallRecord {
+    const call_id = try alloc.dupe(u8, record.call_id);
+    errdefer alloc.free(call_id);
+    const request_id = try alloc.dupe(u8, record.request_id);
+    errdefer alloc.free(request_id);
+    return .{ .call_id = call_id, .request_id = request_id, .tool = try alloc.dupe(u8, record.tool), .outcome = record.outcome };
+}
+
+pub fn freeBridgeCallRecordStrings(alloc: std.mem.Allocator, record: BridgeCallRecord) void {
+    alloc.free(record.call_id);
+    alloc.free(record.request_id);
+    alloc.free(record.tool);
+}
+
+/// Caller owns the copy; free it with `freeBridgeCallRecords`.
+pub fn dupeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) ![]BridgeCallRecord {
+    const copies = try alloc.alloc(BridgeCallRecord, records.len);
+    var done: usize = 0;
+    errdefer {
+        for (copies[0..done]) |copy| freeBridgeCallRecordStrings(alloc, copy);
+        alloc.free(copies);
+    }
+    for (records, copies) |record, *copy| {
+        copy.* = try dupeBridgeCallRecord(alloc, record);
+        done += 1;
+    }
+    return copies;
+}
+
+pub fn freeBridgeCallRecords(alloc: std.mem.Allocator, records: []const BridgeCallRecord) void {
+    for (records) |record| freeBridgeCallRecordStrings(alloc, record);
+    alloc.free(records);
+}
+
 pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
@@ -1552,6 +1657,11 @@ pub const ExecutionMemory = struct {
     /// The turn's settled model calls, in order, for Ctrl+O. Display data:
     /// never part of what the model is sent.
     model_calls: []ModelCallRecord = &.{},
+    /// The calls the turn's commands made through `fx mcp call`, in the
+    /// order they ended, each naming its shell call. Only a resumed turn
+    /// holds them, for the rows its replay shows; display data, never part
+    /// of what the model is sent.
+    bridge_calls: []BridgeCallRecord = &.{},
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
@@ -1657,6 +1767,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
+        .subagent_started = memory.subagent_started,
     };
 }
 
@@ -2756,6 +2867,10 @@ pub const FinishedPrompt = struct {
     terminal_projection: FinishedPromptProjection = .history_default,
     terminal_outcome: ?TurnPresentationOutcome = null,
     snapshot_file_ownership: ?SnapshotFileOwnership = null,
+    /// The workspace capture token of this turn (D98), set by the app as
+    /// the turn's end capture is taken, so the commit writes only this
+    /// turn's captures however late it runs; 0 when it has none.
+    capture_turn: u64 = 0,
 };
 
 pub const PermissionMode = enum {
@@ -3154,6 +3269,7 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
         .terminal_projection = finished.terminal_projection,
         .terminal_outcome = finished.terminal_outcome,
         .snapshot_file_ownership = finished.snapshot_file_ownership,
+        .capture_turn = finished.capture_turn,
     };
 }
 
@@ -3195,6 +3311,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
     errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
     const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
+    errdefer freeModelCallRecords(alloc, model_calls);
+    const bridge_calls = try dupeBridgeCallRecords(alloc, memory.bridge_calls);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -3203,10 +3321,12 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .runtime_context = runtime_context,
         .turn_summary = memory.turn_summary,
         .model_calls = model_calls,
+        .bridge_calls = bridge_calls,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
+    freeBridgeCallRecords(alloc, memory.bridge_calls);
     freeModelCallRecords(alloc, memory.model_calls);
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
@@ -3559,6 +3679,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
+        .subagent_started = result.subagent_started,
     };
 }
 
