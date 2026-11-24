@@ -124,3 +124,19 @@ Platform and toolchain: macOS arm64, Zig 0.17.1, Bun 1.4.5, Node v26.13.1, Pytho
 | SDK: `test-journal.mjs`, `test-agent-correlation.mjs`, `test-node-napi.mjs`, `test-node-package.mjs` | Passed |
 
 Outstanding for hosted CI: Linux x64/arm64 builds and ABI checks, macOS arm64 hosted CI lane, remaining E2E corpus files, TLA+ workflows, WASM browser/Node JSPI suites, and live-model tests.
+
+## kai-runtime `feat/subagent-timeout-and-macos-cli`
+
+Added per-child profile timeout (`max_duration_seconds` in `profiles.zig`, plumbed through `authority.zig`, `domain.zig`, `tool_host.zig`, `config.zig`, `orchestrator.zig`, and enforced via a child-scoped `DurationWatchdog` in `agent_adapter.zig`), parameterized `scripts/sign-and-notarize-macos.sh`, added optional macOS CLI packaging (`@kunemi-group/kai-cli-darwin-arm64`, `-x64`) to `scripts/package-private-cli.sh`, and bumped `publish-private-libfx.yml` to Zig 0.17.1 with a `cli-macos` matrix.
+
+Platform and toolchain: macOS arm64, Zig 0.17.1, Python 3.
+
+| Step | Result |
+| --- | --- |
+| `zig fmt --check src/`, `git diff --check`, `bash -n` on signing and packaging scripts | Passed |
+| Boundary and surface guards (`compactor`, `indexer`, `recovery`, `agents`, `public-surface`) | Passed |
+| `python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.pgso.tests.test_corpus` | Passed (`66` tests) |
+| `zig build` and `zig build test` | Passed (exit `0`) |
+| Built `./zig-out/bin/fx` smoke (`--version` and `config get max_subagents`) | Passed (`0.0.17`, `0`, clean stderr) |
+
+Outstanding for hosted CI: Linux x64/arm64 and macOS arm64 PR CI lanes, `publish-private-libfx.yml` `cli-macos` publish run, and Apple Developer ID signing and notarization once Apple secrets are configured.

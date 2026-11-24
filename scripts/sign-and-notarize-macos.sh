@@ -4,9 +4,9 @@ set -euo pipefail
 
 umask 077
 
-signing_identity="Developer ID Application: Vercel, Inc (JW6Y669B67)"
-signing_identifier="com.vercel.fx"
-signing_team_id="JW6Y669B67"
+signing_identity="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Vercel, Inc (JW6Y669B67)}"
+signing_identifier="${APPLE_SIGNING_IDENTIFIER:-com.vercel.fx}"
+signing_team_id="${APPLE_SIGNING_TEAM_ID:-JW6Y669B67}"
 
 openssl_bin="${FX_SIGNING_OPENSSL_BIN:-/usr/bin/openssl}"
 security_bin="${FX_SIGNING_SECURITY_BIN:-/usr/bin/security}"

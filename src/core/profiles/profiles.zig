@@ -72,6 +72,9 @@ pub const Profile = struct {
     /// The most tokens, input and output together, a turn of an agent in this
     /// profile spends before it stops; null sets no limit of its own.
     max_tokens: ?u64 = null,
+    /// The longest a turn of an agent in this profile runs before it stops;
+    /// null sets no wall-clock limit of its own.
+    max_duration_seconds: ?u64 = null,
     ignored: []const Ignored = &.{},
 };
 
@@ -250,6 +253,8 @@ pub fn parse(
             profile.max_steps = @intCast(try positiveField(arena, failure, name, key, value));
         } else if (std.mem.eql(u8, key, "max_tokens")) {
             profile.max_tokens = try positiveField(arena, failure, name, key, value);
+        } else if (std.mem.eql(u8, key, "max_duration_seconds")) {
+            profile.max_duration_seconds = try positiveField(arena, failure, name, key, value);
         } else if (std.mem.eql(u8, key, "prompt")) {
             const raw = try stringField(arena, failure, name, key, value);
             profile.prompt_mode = std.meta.stringToEnum(PromptMode, raw) orelse
@@ -902,28 +907,32 @@ test "a profile without a description, with bad JSON, or with a bad value is ref
     try testing.expectError(error.InvalidProfile, parse(arena, "Bad Name", .home, "{\"description\": \"x\"}", "", &failure));
 }
 
-test "a profile's step and token limits parse, from the user's profile or a repository's" {
+test "a profile's step, token, and duration limits parse, from the user's profile or a repository's" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     for ([_]Source{ .home, .project }) |source| {
         const limited = try testParse(arena, source,
-            \\{"description": "Bounded", "max_steps": 12, "max_tokens": 40000}
+            \\{"description": "Bounded", "max_steps": 12, "max_tokens": 40000, "max_duration_seconds": 300}
         , "");
         try testing.expectEqual(@as(usize, 12), limited.max_steps.?);
         try testing.expectEqual(@as(u64, 40000), limited.max_tokens.?);
+        try testing.expectEqual(@as(u64, 300), limited.max_duration_seconds.?);
         try testing.expectEqual(@as(usize, 0), limited.ignored.len);
     }
     const plain = try testParse(arena, .home,
         \\{"description": "Plain"}
     , "");
-    try testing.expect(plain.max_steps == null and plain.max_tokens == null);
+    try testing.expect(plain.max_steps == null and plain.max_tokens == null and plain.max_duration_seconds == null);
     for ([_][]const u8{
         "{\"description\": \"x\", \"max_steps\": 0}",
         "{\"description\": \"x\", \"max_steps\": -3}",
         "{\"description\": \"x\", \"max_tokens\": \"many\"}",
         "{\"description\": \"x\", \"max_tokens\": 1.5}",
         "{\"description\": \"x\", \"max_tokens\": 99999999999}",
+        "{\"description\": \"x\", \"max_duration_seconds\": 0}",
+        "{\"description\": \"x\", \"max_duration_seconds\": -5}",
+        "{\"description\": \"x\", \"max_duration_seconds\": \"forever\"}",
     }) |json| {
         var failure: ?[]const u8 = null;
         try testing.expectError(error.InvalidProfile, parse(arena, "worker", .home, json, "", &failure));

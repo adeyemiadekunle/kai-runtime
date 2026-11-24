@@ -73,7 +73,7 @@ jobs:
           ref: ${{ needs.metadata.outputs.sha }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: "0.17.0"
+          version: "0.17.1"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
@@ -104,7 +104,7 @@ jobs:
           ref: ${{ needs.metadata.outputs.sha }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: "0.17.0"
+          version: "0.17.1"
       # Static builds, as fx's own Linux releases are, for Dotrix's coding image.
       - name: Build fx for Linux x64 and arm64
         run: |
@@ -120,8 +120,57 @@ jobs:
           path: fx-bins/
           if-no-files-found: error
 
+  cli-macos:
+    needs: metadata
+    name: fx command (${{ matrix.package_platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            package_platform: darwin-arm64
+          - runner: macos-15-intel
+            package_platform: darwin-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.1"
+      - name: Build fx for ${{ matrix.package_platform }}
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dupdate-channel=stable
+          scripts/smoke-binary.sh zig-out/bin/fx
+      - name: Sign and notarize fx when Apple credentials are configured
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_SIGNING_IDENTIFIER: ${{ vars.APPLE_SIGNING_IDENTIFIER || 'com.kunemi.kai' }}
+          APPLE_SIGNING_TEAM_ID: ${{ secrets.APPLE_SIGNING_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p fx-bins
+          cp zig-out/bin/fx "fx-bins/fx-${{ matrix.package_platform }}"
+          if [ -n "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            scripts/sign-and-notarize-macos.sh "fx-bins/fx-${{ matrix.package_platform }}"
+          else
+            codesign --force --sign - "fx-bins/fx-${{ matrix.package_platform }}"
+            codesign --verify --strict "fx-bins/fx-${{ matrix.package_platform }}"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kai-cli-${{ matrix.package_platform }}
+          path: fx-bins/fx-${{ matrix.package_platform }}
+          if-no-files-found: error
+
   publish:
-    needs: [metadata, native, cli]
+    needs: [metadata, native, cli, cli-macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -131,7 +180,7 @@ jobs:
           ref: ${{ needs.metadata.outputs.sha }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: "0.17.0"
+          version: "0.17.1"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.18.0"
@@ -160,8 +209,9 @@ jobs:
         run: scripts/package-private-libfx.sh native-addons out --publish
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: kai-cli
+          pattern: kai-cli*
           path: fx-bins
+          merge-multiple: true
       - name: Pack and publish the fx command
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
