@@ -20,6 +20,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - An answer the provider cut off at its output limit is no longer replayed as a completed answer. Retrying that turn by ID, after a restart or in the same process, reports `max_output_tokens` instead of `end_turn`. The saved turn records `output_limited`, so a journal or checkpoint holding one is version 5, which fx 0.0.16 and 0.0.17 refuse as newer rather than misread. Journals written by fx 0.0.17 before this fix never recorded the cutoff.
 - `printf` with data that starts with `--` takes the shell path instead of running `/usr/bin/printf` directly, which on uutils read it as an option (the upstream repair, backported).
 - Merged upstream `adeyemiadekunle/kai` changes through commit `170f50e4` (931 commits): shared MCP server processes, subagent and shell cancellation and steering repairs, crash diagnostics, `max` reasoning effort, and structured `Refusal` handling (preserving `max_subagents` enforcement through `Refusal.too_many_subagents`).
+- Saved the nightly fuzz reproducer `tool_story_rows-3bd5eb094843` from issue #21 in `tests/fuzz/corpus/tool_story_rows/` after confirming it passes on `main` following the upstream `170f50e4` merge.
 
 ### Security
 
