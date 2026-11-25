@@ -14,14 +14,19 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
 const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
+const toolbox = @import("../../core/tooling/toolbox.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const read_tool_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
+const mcp_tool_names = @import("../../core/mcp/tool_names.zig");
+const skill_invocation = @import("../../core/skills/skill_invocation.zig");
+const session_adapter = @import("../../core/session/session_adapter.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 const cancellation_follow_up = " · What can fx do differently?";
+const cancelled_label = "Cancelled";
 
 // The small helpers marked `noinline` below are called from many places in
 // the rows and headers. LLVM would copy each into every caller, and those
@@ -257,14 +262,73 @@ fn statusNamesAsk(entry: TranscriptEntry, detail: ?*const ToolDetailRecord) bool
     };
 }
 
+/// A question that fx stopped before the person answered it, by a crash or
+/// a closed window, as a resume shows it: "● Couldn't ask you · fx stopped",
+/// where core's row says only "Failed". Null for any other question's row.
+/// The caller owns the result.
+fn stoppedQuestionRow(alloc: std.mem.Allocator, detail: ?*const ToolDetailRecord, entry_id: u32, cols: u16, style: SummaryStyle) !?GroupBlock {
+    const record = detail orelse return null;
+    if (record.outcome != .failed) return null;
+    if (!std.mem.eql(u8, record.result orelse return null, session_adapter.unfinished_tool_output)) return null;
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const row = try std.mem.concat(scratch, u8, &.{
+        "● ",
+        try inFailureStyle(scratch, "Couldn't ask you", style),
+        style.text_style,
+        " · ",
+        try inFailureStyle(scratch, "fx stopped", style),
+    });
+    const bytes = try applySummaryStyle(alloc, try clipSummary(scratch, row, cols), style);
+    errdefer alloc.free(bytes);
+    const lines = try alloc.alloc(transcript_blocks.LineProvenance, 1);
+    lines[0] = .{ .entry = .{ .entry_id = entry_id, .entry_class = .tool_status, .projection_part = .group_header } };
+    return .{ .bytes = bytes, .lines = lines };
+}
+
+test "a question fx stopped before the person answered says so after a resume" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Failed\n", .class = .tool_status } }};
+    var details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = @constCast("ask_user_question"),
+        .activity_kind = .ask,
+        .arguments_json = @constCast("{\"questions\":[{\"question\":\"Ship it?\"}]}"),
+        .result = @constCast(session_adapter.unfinished_tool_output),
+        .outcome = .failed,
+        .origin = .recorded,
+    }};
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("● Couldn't ask you · fx stopped", std.mem.trim(u8, text, "\n"));
+
+    // A question that failed another way keeps core's row.
+    details[0].result = @constCast("{\"error\":\"no terminal to ask in\"}");
+    var other = try build(alloc, &entries, &details, 120);
+    defer other.deinit(alloc);
+    try std.testing.expect(other.entry_actions.items[0] == .keep);
+}
+
 /// Whether a row shows a subagent's report or message to main, which its
-/// detail marks (src/core/subagent/reports.zig, Row). Live, main's calls
-/// have a presentation group and this row has none, so it never joins their
-/// group. Resumed rows have no presentation group, so a run of rows splits
-/// where such rows start and end instead.
+/// detail marks (src/core/subagent/reports.zig, Row).
 fn isSubagentUpdateRow(detail: ?*const ToolDetailRecord) bool {
     const record = detail orelse return false;
     return record.subagent_report;
+}
+
+/// What a status row does to a run of rows that have no presentation group,
+/// as resumed rows have none.
+const RunRow = enum { joins, stays_out, ends };
+
+/// Groups a run as live groups the same rows. Live, main's calls share
+/// their presentation group until the model writes text, and a report or
+/// message has none, so it neither joins nor ends their group: it keeps a
+/// line of its own after it, and reports next to each other share one.
+fn runRow(entry: TranscriptEntry, detail: ?*const ToolDetailRecord, updates_run: bool) RunRow {
+    if (statusNamesAsk(entry, detail)) return .ends;
+    if (isSubagentUpdateRow(detail) == updates_run) return .joins;
+    return if (updates_run) .ends else .stays_out;
 }
 
 fn isAttachedEntry(entry: TranscriptEntry) bool {
@@ -395,14 +459,14 @@ fn normalizeCanonicalStatus(
     return if (phrase.len == 0) null else phrase;
 }
 
-/// The cancellation notice of a cancelled shell command's status line `raw`,
-/// such as `▪ Cancelled touch .ready && sleep 60 · What can fx do
-/// differently?`, with no command: `▪ Cancelled · What can fx do
-/// differently?`, the notice a cancelled turn shows. The row above names the
-/// command by its short form and Ctrl+O by its full line, so the notice
-/// repeats neither. The line keeps its styles. Null when `raw` doesn't read
-/// `Cancelled …` after its mark.
-fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+/// The cancellation notice of a cancelled call's status line `raw`, such as
+/// `▪ Cancelled touch .ready && sleep 60 · What can fx do differently?`,
+/// with `name` in place of what core named. A shell command's notice has no
+/// name: `▪ Cancelled · What can fx do differently?`, the notice a cancelled
+/// turn shows, since the row above names the command by its short form and
+/// Ctrl+O by its full line. The line keeps its styles. Null when `raw`
+/// doesn't read `Cancelled …` after its mark.
+fn cancelledNotice(scratch: std.mem.Allocator, raw: []const u8, name: []const u8) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(raw, &index)) {}
     const marker = for (status_markers) |candidate| {
@@ -417,18 +481,18 @@ fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const
         }
         break;
     }
-    const label = "Cancelled";
-    if (!std.mem.startsWith(u8, raw[index..], label)) return null;
-    const kept_end = index + label.len;
-    // The command ends at the follow-up, or at the line's end on a line
-    // saved without one.
+    if (!std.mem.startsWith(u8, raw[index..], cancelled_label)) return null;
+    const kept_end = index + cancelled_label.len;
+    // The name ends at the follow-up, or at the line's end on a line saved
+    // without one.
     const tail_at = std.mem.findLast(u8, raw[kept_end..], cancellation_follow_up) orelse
         std.mem.trimEnd(u8, raw[kept_end..], "\r\n").len;
     var out: std.Io.Writer.Allocating = .init(scratch);
     errdefer out.deinit();
     try out.writer.writeAll(raw[0..kept_end]);
-    // The command's text goes, and its style codes stay, so every style the
-    // line opens still closes.
+    if (name.len > 0) try out.writer.print(" {s}", .{name});
+    // Core's name goes, and its style codes stay, so every style the line
+    // opens still closes.
     var cursor = kept_end;
     while (cursor < kept_end + tail_at) {
         const start = cursor;
@@ -524,10 +588,208 @@ const StatToken = struct {
 
 /// Diff counts exist only on write_file/edit_file status lines; every other
 /// phrase can end in a coincidental " +N" / "-N" (for example `head -80`).
-noinline fn entryShowsDiffStats(detail: ?*const ToolDetailRecord) bool {
-    const record = detail orelse return false;
-    return std.mem.eql(u8, record.tool_name, "write_file") or
-        std.mem.eql(u8, record.tool_name, "edit_file");
+noinline fn entryShowsDiffStats(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !bool {
+    return try fileChangeOf(scratch, detail) != null;
+}
+
+/// The edit or write a record stands for: the tool and the arguments it ran
+/// with.
+const FileChange = struct { tool: []const u8, arguments: ?[]const u8 };
+
+fn isFileChangeTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file");
+}
+
+/// The edit or write a record stands for: its own call of `edit_file` or
+/// `write_file`, or the one a toolbox run of it carries, whose record can keep
+/// toolbox's name and the run's wrapped arguments. Null for any other call.
+fn fileChangeOf(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !?FileChange {
+    const record = detail orelse return null;
+    if (isFileChangeTool(record.tool_name)) return .{ .tool = record.tool_name, .arguments = record.arguments_json };
+    const run = (try toolbox.carriedCall(scratch, record.tool_name, record.arguments_json orelse return null)) orelse return null;
+    if (!isFileChangeTool(run.name)) return null;
+    return .{ .tool = run.name, .arguments = run.arguments_json };
+}
+
+/// The path an edit or write's status names after its one-word verb, such
+/// as "tsec/main.zig" in "Edited tsec/main.zig +1 / -7", for a record that
+/// kept no path of its own: a completed call's, or a running call's whose
+/// arguments have not arrived. Null for a call that failed, was denied, or
+/// was cancelled, whose status does not name the file it changed.
+fn statusFilePath(record: *const ToolDetailRecord, phrase: []const u8) ?[]const u8 {
+    if (record.outcome) |outcome| {
+        if (outcome != .completed) return null;
+    } else if (storyHasArgs(record)) return null;
+    const named = std.mem.trimEnd(u8, if (diffStatsSuffixStart(phrase)) |at| phrase[0..at] else phrase, " ");
+    const space = findByte(named, ' ') orelse return null;
+    const path = named[space + 1 ..];
+    if (std.Io.Dir.path.basename(path).len == 0) return null;
+    return path;
+}
+
+/// A path without its "." parts and repeated or trailing slashes, so
+/// "./src//main.zig" and "src/main.zig" are one file. ".." parts stay, since a
+/// symlinked folder can make them name another file. The result is allocated
+/// in `scratch` when the path changes.
+fn normalizedPath(scratch: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (std.mem.startsWith(u8, path, "/")) try out.append(scratch, '/');
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '/') try out.append(scratch, '/');
+        try out.appendSlice(scratch, part);
+    }
+    if (std.mem.eql(u8, out.items, path)) return path;
+    return out.items;
+}
+
+/// The row identity of a completed edit or write, or one still running,
+/// that named the file `named`. Its key is the file core says the call
+/// changed (`ToolDetailRecord.resolved_path`), the same for every way of
+/// naming one file, or, before the call ends, the path it named. `alias` is
+/// the path it named, so a call still running joins the row of calls that
+/// named the file the same way.
+fn fileChangeIdentity(scratch: std.mem.Allocator, record: *const ToolDetailRecord, named: []const u8) !StoryIdentity {
+    const alias = try normalizedPath(scratch, named);
+    return .{ .kind = .edit, .key = record.resolved_path orelse alias, .alias = alias };
+}
+
+test "an edit row's file key is the same for each way a call names the file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "src/main.zig", "./src/main.zig", "src//main.zig", "src/./main.zig", "src/main.zig/" }) |path| {
+        try std.testing.expectEqualStrings("src/main.zig", try normalizedPath(arena, path));
+    }
+    try std.testing.expectEqualStrings("/w/src/main.zig", try normalizedPath(arena, "/w/./src//main.zig"));
+    try std.testing.expectEqualStrings("../src/main.zig", try normalizedPath(arena, "./../src/main.zig"));
+
+    const completed = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed };
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&completed, "Edited tsec/main.tse +1 / -7").?);
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&completed, "Edited tsec/main.tse -7").?);
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&completed, "Wrote tsec/main.tse").?);
+    try std.testing.expect(statusFilePath(&completed, "Edited") == null);
+    var running = completed;
+    running.outcome = null;
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&running, "Editing tsec/main.tse").?);
+    try std.testing.expect(statusFilePath(&running, "Editing") == null);
+    // A running call with its arguments names its file by them.
+    running.arguments_json = @constCast("{\"path\":\"tsec/main.tse\"}");
+    try std.testing.expect(statusFilePath(&running, "Editing tsec/main.tse") == null);
+    var failed = completed;
+    failed.outcome = .failed;
+    try std.testing.expect(statusFilePath(&failed, "Failed tsec/main.tse: old_string not found") == null);
+}
+
+test "edits read by their file whether their records keep toolbox's run or no arguments" {
+    const alloc = std.testing.allocator;
+    const Edit = struct { path: []const u8, stats: []const u8 };
+    const edits = [_]Edit{
+        .{ .path = "tsec/selfhost/checker-types.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/selfhost/checker-types.tse", .stats = "+48 / -100" },
+        .{ .path = "tsec/selfhost/checker-types.tse", .stats = "+38 / -78" },
+        .{ .path = "tsec/selfhost/checker-world.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/selfhost/checker-world.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/selfhost/checker-world.tse", .stats = "+5 / -11" },
+        .{ .path = "tsec/selfhost/checker.tse", .stats = "-7" },
+        .{ .path = "tsec/selfhost/checker-resolve.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/test/query-codegen.ts", .stats = "+1 / -7" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entries: [edits.len + 1]TranscriptEntry = undefined;
+    var direct: [edits.len]ToolDetailRecord = undefined;
+    for (edits, 0..) |edit, index| {
+        const id: u32 = @intCast(index + 1);
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = try std.mem.concat(arena, u8, &.{ "● Edited ", edit.path, " ", edit.stats, "\n" }), .class = .tool_status } };
+        const arguments = try std.mem.concat(arena, u8, &.{ "{\"path\":\"", edit.path, "\",\"old_string\":\"a\",\"new_string\":\"b\"}" });
+        direct[index] = .{ .entry_id = id, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = arguments, .outcome = .completed };
+    }
+    entries[edits.len] = .{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    var through_toolbox = direct;
+    var without_arguments = direct;
+    for (&through_toolbox, &without_arguments) |*run, *bare| {
+        run.tool_name = @constCast("toolbox");
+        run.arguments_json = try std.mem.concat(arena, u8, &.{ "{\"run\":\"edit_file\",\"arguments\":", run.arguments_json.?, "}" });
+        bare.arguments_json = null;
+    }
+    const want =
+        "\n● Edited files\n" ++
+        "├ Edited checker-types.tse +87/-185 · 3 edits\n" ++
+        "├ Edited checker-world.tse +7/-25 · 3 edits\n" ++
+        "├ Edited checker.tse -7\n" ++
+        "├ Edited checker-resolve.tse +1/-7\n" ++
+        "└ Edited query-codegen.ts +1/-7\n" ++
+        "  5 files changed +96 -231 · 2s";
+    for ([_][]const ToolDetailRecord{ &direct, &through_toolbox, &without_arguments }) |details| {
+        const text = try groupTextForTest(alloc, &entries, details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group of {s} records:\n{s}\n", .{ details[0].tool_name, text });
+        try std.testing.expectEqualStrings(want, text);
+    }
+}
+
+test "an edit row joins every way its calls named one file, and same-named files in other folders stay apart" {
+    const alloc = std.testing.allocator;
+    const Edit = struct { named: []const u8, changed: []const u8, outcome: ?types.ToolOutcomeKind = .completed };
+    const edits = [_]Edit{
+        .{ .named = "tsec/selfhost/a.tse", .changed = "tsec/selfhost/a.tse" },
+        .{ .named = "./tsec/selfhost/a.tse", .changed = "tsec/selfhost/a.tse" },
+        .{ .named = "/w/tsec/selfhost/a.tse", .changed = "tsec/selfhost/a.tse" },
+        .{ .named = "tsec/test/a.tse", .changed = "tsec/test/a.tse" },
+        // A symlinked folder and its target are one file too.
+        .{ .named = "/tmp/notes.md", .changed = "/private/tmp/notes.md" },
+        .{ .named = "/private/tmp/notes.md", .changed = "/private/tmp/notes.md" },
+        // A call still running joins the row of calls that named the file
+        // its way, before its result says which file it changed.
+        .{ .named = "/w/tsec/selfhost/a.tse", .changed = "", .outcome = null },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entries: [edits.len + 1]TranscriptEntry = undefined;
+    var details: [edits.len]ToolDetailRecord = undefined;
+    for (edits, 0..) |edit, index| {
+        const id: u32 = @intCast(index + 1);
+        const status = if (edit.outcome == null) try std.mem.concat(arena, u8, &.{ "● Editing ", edit.named, "\n" }) else try std.mem.concat(arena, u8, &.{ "● Edited ", edit.named, " +1 / -7\n" });
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = status, .class = .tool_status } };
+        details[index] = .{
+            .entry_id = id,
+            .tool_name = @constCast("edit_file"),
+            .activity_kind = .edit,
+            .arguments_json = try std.mem.concat(arena, u8, &.{ "{\"path\":\"", edit.named, "\",\"old_string\":\"a\",\"new_string\":\"b\"}" }),
+            .resolved_path = if (edit.outcome == null) null else @constCast(edit.changed),
+            .outcome = edit.outcome,
+        };
+    }
+    entries[edits.len] = .{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    const text = try groupTextForTest(alloc, entries[0..edits.len], &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings(
+        "\n● Editing files\n" ++
+            "├ Editing a.tse +3/-21 · 4 edits\n" ++
+            "├ Edited a.tse +1/-7\n" ++
+            "└ Edited notes.md +2/-14 · 2 edits",
+        text,
+    );
+    // Once the last call ends, the recap counts each file once.
+    details[edits.len - 1].outcome = .completed;
+    details[edits.len - 1].resolved_path = @constCast("tsec/selfhost/a.tse");
+    entries[edits.len - 1].raw_bytes.bytes = "● Edited /w/tsec/selfhost/a.tse +1 / -7\n";
+    const ended = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(ended);
+    errdefer std.debug.print("ended group:\n{s}\n", .{ended});
+    try std.testing.expectEqualStrings(
+        "\n● Edited files\n" ++
+            "├ Edited a.tse +4/-28 · 4 edits\n" ++
+            "├ Edited a.tse +1/-7\n" ++
+            "└ Edited notes.md +2/-14 · 2 edits\n" ++
+            "  3 files changed +7 -49 · 2s",
+        ended,
+    );
 }
 
 /// Matches a trailing " +N" or " -N" diff count in a plain status phrase, or
@@ -930,7 +1192,12 @@ fn skipJsonValue(json: []const u8, start: usize) ?usize {
 }
 
 noinline fn storyArgString(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?[]const u8 {
-    const json = record.arguments_json orelse return null;
+    return jsonArgString(scratch, record.arguments_json, key);
+}
+
+/// A non-empty string field of a call's arguments.
+fn jsonArgString(scratch: std.mem.Allocator, arguments_json: ?[]const u8, key: []const u8) ?[]const u8 {
+    const json = arguments_json orelse return null;
     return switch (jsonField(scratch, json, key) orelse return null) {
         .string => |text| if (text.len > 0) text else null,
         else => null,
@@ -1015,6 +1282,8 @@ const StoryTally = struct {
     /// toolbox calls that open a tool or search for one, which read no file.
     tool_opens: usize = 0,
     toolbox_searches: usize = 0,
+    /// toolbox calls that open a skill.
+    skill_opens: usize = 0,
     subagent_calls: usize = 0,
     subagent_names: std.ArrayList([]const u8) = .empty,
     /// What the group's subagent rows say, set from the rows once they are
@@ -1075,8 +1344,13 @@ const StoryTally = struct {
                 self.change_calls += 1;
                 if (record.outcome == null) self.changes_running += 1;
                 if (kind == .write) self.write_calls += 1;
-                if (storyArgString(scratch, record, "path")) |path| try addDistinct(&self.changed_paths, scratch, path);
                 const phrase = try entryStatus(scratch, entry) orelse "";
+                // One file counts once, however its calls named it.
+                if (try fileChangeOf(scratch, record)) |change| {
+                    if (jsonArgString(scratch, change.arguments, "path") orelse statusFilePath(record, phrase)) |path| {
+                        try addDistinct(&self.changed_paths, scratch, (try fileChangeIdentity(scratch, record, path)).key);
+                    }
+                }
                 const totals = diffTotalsOfPhrase(phrase);
                 self.diff.added += totals.added;
                 self.diff.removed += totals.removed;
@@ -1116,7 +1390,13 @@ const StoryTally = struct {
                 if (std.mem.eql(u8, name, "read_file")) {
                     if (storyArgString(scratch, record, "path")) |path| try addDistinct(&self.read_paths, scratch, path) else self.unnamed_reads += 1;
                 } else if (std.mem.eql(u8, name, "toolbox")) {
-                    if (storyArgString(scratch, record, "open") != null) self.tool_opens += 1 else self.toolbox_searches += 1;
+                    if (storyArgString(scratch, record, "open") == null) {
+                        self.toolbox_searches += 1;
+                    } else if (toolboxOpensSkill(scratch, record)) {
+                        self.skill_opens += 1;
+                    } else {
+                        self.tool_opens += 1;
+                    }
                 } else if (std.mem.eql(u8, name, "web_search") or isProviderSearchName(name)) {
                     self.web_searches += 1;
                 } else if (std.mem.eql(u8, name, "web_fetch")) {
@@ -1157,6 +1437,48 @@ const StoryTally = struct {
         return if (self.changed_paths.items.len > 0) self.changed_paths.items.len else self.change_calls;
     }
 };
+
+/// Whether a toolbox call opens a skill: its `kind` says so, it opens a
+/// skill's location, or its result is the skill's text. Core reads an open
+/// without a `kind` as a skill's when no tool or server has the name
+/// (`lookupOf` in src/core/tooling/toolbox.zig).
+fn toolboxOpensSkill(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    if (storyArgString(scratch, record, "kind")) |kind| return std.mem.eql(u8, kind, "skill");
+    const target = storyArgString(scratch, record, "open") orelse return false;
+    if (std.mem.startsWith(u8, target, "skill:") or std.Io.Dir.path.isAbsolute(target)) return true;
+    const result = record.result orelse return false;
+    return std.mem.startsWith(u8, result, skill_invocation.content_name_prefix);
+}
+
+test "a toolbox open of a skill counts as a skill in its group's header" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched toolbox signature account\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched toolbox settings\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran MCP mcp_bloop_get_account\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Opened ste-english\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● Read /w/a.zig\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast("{\"search\":\"signature account\"}"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast("{\"search\":\"settings\"}"), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast("{\"run\":\"mcp_bloop_get_account\",\"arguments\":{}}"), .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("toolbox"), .activity_kind = .read, .arguments_json = @constCast("{\"open\":\"ste-english\"}"), .result = @constCast("<skill_content name=\"ste-english\" resource=\"SKILL.md\">\n---\nname: ste-english\n"), .outcome = .completed },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/a.zig\"}"), .outcome = .completed },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("skill:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings("● Searched the toolbox, used an MCP tool, opened a skill, and more", firstLineForTest(text));
+    try std.testing.expect(std.mem.find(u8, text, "├ Opened ste-english\n") != null);
+
+    // An open of an MCP server or a tool still opens a tool.
+    details[3].arguments_json = @constCast("{\"open\":\"linear\",\"kind\":\"mcp_server\"}");
+    details[3].result = @constCast("{\"server\":\"linear\",\"tools\":[]}");
+    const tool = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(tool);
+    try std.testing.expectEqualStrings("● Searched the toolbox, used an MCP tool, opened a tool, and more", firstLineForTest(tool));
+}
 
 /// What a row of main's `subagent` calls says its latest call did, which
 /// its group's header names in turn.
@@ -1245,8 +1567,25 @@ fn subagentRowDeed(scratch: std.mem.Allocator, row: *const StoryRow) !?SubagentD
     return .other;
 }
 
-/// The verbs core puts before the subagents a wait concerns.
-const wait_leads = [_][]const u8{ "waited for ", "waiting for " };
+/// The verbs core puts before the subagents a wait concerns, and the word
+/// it puts before those of a wait the user stopped.
+const wait_leads = [_][]const u8{ "waited for ", "waiting for ", stopped_wait_lead };
+
+/// What core's status of a wait the user stopped leads with:
+/// "Cancelled lander" (`subagentAction` in
+/// src/core/tooling/tool_presentation.zig). Ctrl+O keeps core's words.
+const stopped_wait_lead = "Cancelled ";
+
+/// The subagents a wait the user stopped waited for, from `lead`, its
+/// status's lead, such as "lander" from "Cancelled lander". The row reads
+/// "Stopped waiting for lander", never "Cancelled lander", which would say
+/// the subagent was cancelled. Null for any other call.
+fn stoppedWaitNames(scratch: std.mem.Allocator, record: *const ToolDetailRecord, lead: []const u8) ?[]const u8 {
+    if (record.outcome != .cancelled or !isWaitAction(scratch, record)) return null;
+    if (!std.mem.startsWith(u8, lead, stopped_wait_lead)) return null;
+    const names = lead[stopped_wait_lead.len..];
+    return if (names.len == 0) null else names;
+}
 
 /// What core puts after a wait's verb when it lists no subagents
 /// (`action_words` in src/core/tooling/tool_presentation.zig).
@@ -1523,6 +1862,7 @@ const WorkKind = enum {
     web_pages,
     web_searches,
     tool_opens,
+    skill_opens,
     toolbox_searches,
     reads,
     output_reads,
@@ -1556,6 +1896,7 @@ fn workAmount(tally: StoryTally, kind: WorkKind) usize {
         .web_pages => tally.web_reads,
         .web_searches => tally.web_searches,
         .tool_opens => tally.tool_opens,
+        .skill_opens => tally.skill_opens,
         .toolbox_searches => tally.toolbox_searches,
         .reads => tally.reads(),
         .output_reads => tally.output_reads,
@@ -1588,6 +1929,7 @@ fn workPhrase(tally: StoryTally, kind: WorkKind) []const u8 {
         .web_pages => if (one) "read a web page" else "read web pages",
         .web_searches => "searched the web",
         .tool_opens => if (one) "opened a tool" else "opened tools",
+        .skill_opens => if (one) "opened a skill" else "opened skills",
         .toolbox_searches => "searched the toolbox",
         .reads => if (one) "read a file" else "read files",
         .output_reads => "read more output",
@@ -1769,6 +2111,10 @@ const StoryRowKind = enum {
     /// wherever it is: one row that names each source once, by its short
     /// name.
     more_output,
+    /// Every search of one earlier call's saved output in the group,
+    /// wherever it is: one row that names the source by its short name and
+    /// each search once.
+    output_search,
     /// The same subagent: its messages, status, and close.
     subagent,
     /// A subagent wait or status that names no agent, keyed by its action.
@@ -1789,7 +2135,12 @@ const StoryRowKind = enum {
 
 const StoryIdentity = struct {
     kind: StoryRowKind = .single,
+    /// What the calls that share a row have in common. A `.single` row has
+    /// none, so its key is empty, except for a cancelled read of saved
+    /// output, whose key is what it read (`savedOutputIdentity`).
     key: []const u8 = "",
+    /// For an `.edit` row, the path its call named (`fileChangeIdentity`).
+    alias: []const u8 = "",
 };
 
 const StoryRow = struct {
@@ -1797,6 +2148,7 @@ const StoryRow = struct {
     entry_id: u32,
     detail: ?*const ToolDetailRecord,
     identity: StoryIdentity,
+    /// How many calls share the row.
     count: usize = 1,
     /// How many of the calls that share the row failed.
     failures: usize = 0,
@@ -1812,6 +2164,15 @@ const StoryRow = struct {
     diff: DiffTotals = .{},
     /// How many of an `.edit` row's calls were writes.
     writes: usize = 0,
+    /// The paths an `.edit` row's calls named the file by, each once.
+    named_paths: std.ArrayList([]const u8) = .empty,
+    /// The file an `.edit` row's latest completed call changed, as core
+    /// resolved it, which the row's name links to.
+    resolved_path: ?[]const u8 = null,
+    /// The file each name of a `.read` row was read from, as core resolved
+    /// it for the latest completed call that named it, which the name links
+    /// to.
+    read_links: std.ArrayList(NameLink) = .empty,
     /// Which try the row's latest call was, when the model repeated a call
     /// that failed and this one completed; 0 otherwise.
     tries: usize = 0,
@@ -1826,6 +2187,13 @@ const StoryRow = struct {
     /// The row's latest call that returned while its command ran on, which
     /// the first later call to its session joins; null when none did.
     background: ?*const ToolDetailRecord = null,
+    /// The server of an MCP row's tool, from the first of its calls' results
+    /// that names it; "" while none does.
+    mcp_server: []const u8 = "",
+    /// An MCP row's server and tool as core named them for the first of its
+    /// calls it could (`ToolDetailRecord.mcp_server`); null while it named
+    /// none. It wins over `mcp_server` and the alias, which can only guess.
+    mcp_tool: ?types.McpToolName = null,
     /// The command the run that started the row's session sent, when the
     /// row's latest call is a later call to that session (sessionLaunchCommand).
     launch_command: ?[]const u8 = null,
@@ -1835,22 +2203,51 @@ const StoryRow = struct {
     /// Whether the row's latest call is a message that makes its subagent
     /// (`messageStarts`).
     starts: bool = false,
-    /// The messages its subagent sent main while main waited, which join a
-    /// wait's row (`joinWaitChain`).
+    /// The messages the group's waits took that this row counts
+    /// (`countWaitMessages`).
     received_messages: usize = 0,
     /// How many calls later rows that said the same stood for, which
     /// joinRepeatedRows folded into this one.
     joined_calls: usize = 0,
 };
 
-/// The name a call adds to a `.read` or `.search` row: the file's path, or
-/// the pattern after the search key's tool name.
+/// The name a call adds to a `.read`, `.search`, `.more_output`, or
+/// `.output_search` row: the file's path, the pattern after the search key's
+/// tool name, the output's source, or the search after the source.
 fn storyRowName(identity: StoryIdentity) ?[]const u8 {
     return switch (identity.kind) {
         .read, .more_output => identity.key,
         .search => if (findByte(identity.key, 0)) |at| identity.key[at + 1 ..] else identity.key,
+        .output_search => outputSearchQuery(identity.key),
         else => null,
     };
+}
+
+/// A name a `.read` row lists, and the file core resolved it to.
+const NameLink = struct { name: []const u8, path: []const u8 };
+
+/// The file core resolved a completed call's path to
+/// (`ToolDetailRecord.resolved_path`). Null for a call that has not
+/// completed, whose path core has not resolved to a file.
+fn completedResolvedPath(detail: ?*const ToolDetailRecord) ?[]const u8 {
+    const record = detail orelse return null;
+    if (record.outcome != .completed) return null;
+    return record.resolved_path;
+}
+
+/// Sets the file `name` was read from, as the newest call that read it says.
+fn setReadLink(links: *std.ArrayList(NameLink), scratch: std.mem.Allocator, name: []const u8, path: []const u8) !void {
+    for (links.items) |*link| if (std.mem.eql(u8, link.name, name)) {
+        link.path = path;
+        return;
+    };
+    try links.append(scratch, .{ .name = name, .path = path });
+}
+
+/// The file core read for `name` in a `.read` row, or null.
+fn readLink(row: *const StoryRow, name: []const u8) ?[]const u8 {
+    for (row.read_links.items) |link| if (std.mem.eql(u8, link.name, name)) return link.path;
+    return null;
 }
 
 /// The search tool of a `.search` row's key, which rows for the same tool
@@ -1859,9 +2256,13 @@ fn storySearchTool(key: []const u8) []const u8 {
     return if (findByte(key, 0)) |at| key[0..at] else key;
 }
 
-/// Whether a row names several files or patterns, so its text lists them.
+/// Whether a row names several files, patterns, sources, or searches, so its
+/// text lists them.
 fn rowListsNames(row: *const StoryRow) bool {
-    return (row.identity.kind == .read or row.identity.kind == .search or row.identity.kind == .more_output) and row.names.items.len > 1;
+    return switch (row.identity.kind) {
+        .read, .search, .more_output, .output_search => row.names.items.len > 1,
+        else => false,
+    };
 }
 
 /// The label a command row's phrase puts before its command, such as "Ran "
@@ -2143,6 +2544,11 @@ fn withoutSuffix(text: []const u8, suffix: []const u8) ?[]const u8 {
     return text[0 .. text.len - suffix.len];
 }
 
+fn withoutPrefix(text: []const u8, prefix: []const u8) ?[]const u8 {
+    if (text.len <= prefix.len or !std.mem.startsWith(u8, text, prefix)) return null;
+    return text[prefix.len..];
+}
+
 /// One way core words a subagent row, and the story's words for it. A lead
 /// that starts with `match`, for a `match` that ends with a space, or ends
 /// with it, for one that starts with a space, reads as `reads` with the rest
@@ -2217,6 +2623,7 @@ fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
     }
     // A report or a message a subagent sent to main.
     if (action == null) return try rewordSubagentLead(scratch, lead, &report_rewordings) orelse lead;
+    if (stoppedWaitNames(scratch, record, lead)) |names| return try std.mem.concat(scratch, u8, &.{ "Stopped waiting for ", names });
     // A wait, status, stop, or close leads with its verb, which takes a
     // capital like "Ran" and "Read".
     const verbs = [_][]const u8{ "waited ", "waiting ", "checked ", "checking ", "stopped ", "stopping ", "closed ", "closing ", "couldn't " };
@@ -2225,9 +2632,26 @@ fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
         capital[0] = std.ascii.toUpper(capital[0]);
         return capital;
     };
-    // Core's status while the call streams, "Managing reviewer".
-    if (record.outcome == null) return try runningSubagentPhrase(scratch, phrase, record, started) orelse lead;
+    // Core's status while the call streams, "Managing reviewer". A call that
+    // names no agent, such as a status check of every subagent, keeps core's
+    // bare "Managing" from its stream's end until it runs, so it reads as core
+    // words it once it runs.
+    if (record.outcome == null) {
+        if (try runningSubagentPhrase(scratch, phrase, record, started)) |running| return running;
+        if (std.mem.findScalar(u8, lead, ' ') == null) if (try activeSubagentLead(scratch, record)) |active| return active;
+    }
     return lead;
+}
+
+/// Core's words for a `subagent` call while it runs, such as "Checking
+/// subagents", with a capital. Null until its arguments parse and name an
+/// action core words that way.
+fn activeSubagentLead(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const call: types.ToolCall = .{ .id = "", .name = record.tool_name, .arguments_json = record.arguments_json orelse return null };
+    const action = try tooling_presentation.subagentAction(scratch, call, .active) orelse return null;
+    if (action.label.len == 0) return null;
+    action.label[0] = std.ascii.toUpper(action.label[0]);
+    return action.label;
 }
 
 /// The verb a `subagent` call that names an agent reads with while its
@@ -2417,12 +2841,46 @@ fn phraseSourceName(scratch: std.mem.Allocator, source: []const u8, handle: []co
     return .{ .full = source, .short = pathFileName(source) orelse source };
 }
 
-/// A read of more of an earlier output joins the group's row of such reads,
-/// which names each source once by its short name. The key is the source in
-/// full, a 0 byte, and its short name, so two files of the same name in two
-/// folders stay two names. A read that failed, was denied, or was cancelled
-/// keeps its own row, as a file read does.
-fn moreOutputIdentity(
+/// The source of the saved output `handle` names: the call in the transcript
+/// that saved it, else `phrase_source`, the source core's row names. Null
+/// when neither names one.
+fn savedOutputName(
+    scratch: std.mem.Allocator,
+    handle: []const u8,
+    phrase_source: ?[]const u8,
+    details: []const ToolDetailRecord,
+    output_sources: *const OutputSources,
+) !?OutputSourceName {
+    if (output_sources.get(handle)) |index| if (try outputSourceName(scratch, &details[index])) |name| return name;
+    return try phraseSourceName(scratch, phrase_source orelse return null, handle);
+}
+
+const searched_output_marker = " output for ";
+
+/// The source core's row of a search of saved output names, as in "Searched
+/// zig build test output for "FAIL"": the text between its verb and
+/// `quoted_query`. Null when the row names none, as while the call streams
+/// in, or names only `noun`, as for an output no call names.
+fn searchedOutputSource(phrase: []const u8, noun: []const u8, quoted_query: []const u8) ?[]const u8 {
+    const before_query = withoutSuffix(phrase, quoted_query) orelse return null;
+    const lead = withoutSuffix(before_query, searched_output_marker) orelse return null;
+    const space = findByte(lead, ' ') orelse return null;
+    const source = lead[space + 1 ..];
+    if (source.len == 0 or std.mem.eql(u8, source, noun)) return null;
+    return source;
+}
+
+/// A read of an earlier call's saved output joins the group's row for what
+/// it does with that output: reads of more of it share the row of such
+/// reads, which names each source once, and searches of it share the row of
+/// its source, which names each search once. A source goes by its short
+/// name. Each key starts with the source in full and a 0 byte, so two files
+/// of the same name in two folders stay apart. A call still streaming in
+/// joins its row once its arguments are whole. A read that failed, was
+/// denied, or was cancelled keeps its own row, as a file read does, and a
+/// cancelled one's key is what it read, as the row it would have joined
+/// names it.
+fn savedOutputIdentity(
     scratch: std.mem.Allocator,
     entry: TranscriptEntry,
     detail: ?*const ToolDetailRecord,
@@ -2432,31 +2890,335 @@ fn moreOutputIdentity(
 ) !StoryIdentity {
     const record = detail orelse return inner;
     if (storyCallFailed(detail)) return inner;
-    if (record.outcome) |outcome| if (outcome != .completed) return inner;
-    const handle = try moreOutputHandle(scratch, record) orelse return inner;
-    const source = moreOutputSource(try entryStatus(scratch, entry) orelse return inner) orelse return inner;
-    const saved = if (output_sources.get(handle)) |index| try outputSourceName(scratch, &details[index]) else null;
-    const name = saved orelse try phraseSourceName(scratch, source, handle) orelse return inner;
-    return .{ .kind = .more_output, .key = try std.mem.concat(scratch, u8, &.{ name.full, "\x00", name.short }) };
+    const cancelled = record.outcome == .cancelled;
+    if (record.outcome) |outcome| if (outcome != .completed and !cancelled) return inner;
+    if (!std.mem.eql(u8, record.tool_name, "read_tool_result")) return inner;
+    const arguments_json = record.arguments_json orelse return inner;
+    const shared = try sharedSavedOutputIdentity(scratch, try entryStatus(scratch, entry) orelse "", arguments_json, details, output_sources) orelse return inner;
+    if (cancelled) return .{ .key = try savedOutputRowTarget(scratch, shared) };
+    return shared;
 }
 
-/// The short name a `.more_output` row shows for a source, after the 0 byte
-/// in its key.
+/// The row a read of saved output shares with the group's other reads of
+/// it, from core's row `phrase` and the call's arguments. Null for a read of
+/// anything else, such as a record.
+fn sharedSavedOutputIdentity(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    arguments_json: []const u8,
+    details: []const ToolDetailRecord,
+    output_sources: *const OutputSources,
+) !?StoryIdentity {
+    if (try read_tool_result_presentation.rangeReadHandle(scratch, arguments_json)) |handle| {
+        const name = try savedOutputName(scratch, handle, moreOutputSource(phrase), details, output_sources) orelse return null;
+        return .{ .kind = .more_output, .key = try std.mem.concat(scratch, u8, &.{ name.full, "\x00", name.short }) };
+    }
+    const search = try read_tool_result_presentation.outputSearch(scratch, arguments_json) orelse return null;
+    const noun = read_tool_result_presentation.savedOutputNoun(search.handle);
+    // An output no call names goes by core's noun for it, and by its handle
+    // in full, so two such outputs stay apart.
+    const name = try savedOutputName(scratch, search.handle, searchedOutputSource(phrase, noun, search.quoted_query), details, output_sources) orelse
+        OutputSourceName{ .full = search.handle, .short = noun };
+    return .{ .kind = .output_search, .key = try std.mem.concat(scratch, u8, &.{ name.full, "\x00", name.short, "\x00", search.quoted_query }) };
+}
+
+/// The short name a `.more_output` or `.output_search` row shows for a
+/// source, after the first 0 byte in its key.
 fn moreOutputShortName(key: []const u8) []const u8 {
-    return if (findByte(key, 0)) |at| key[at + 1 ..] else key;
+    const source = outputSearchSource(key);
+    return if (findByte(source, 0)) |at| source[at + 1 ..] else source;
 }
 
-/// A row of reads of more output that names one source: core's phrase with
-/// the source by its short name. Null for any other row.
-fn moreOutputRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
-    if (row.identity.kind != .more_output) return null;
-    const at = std.mem.find(u8, phrase, more_output_marker) orelse return null;
-    return try std.mem.concat(scratch, u8, &.{ phrase[0 .. at + more_output_marker.len], try terminalSafeText(scratch, moreOutputShortName(row.identity.key)) });
+/// The part of a `.output_search` key that searches of one output share:
+/// the source in full, a 0 byte, and its short name. The whole key for any
+/// other key.
+fn outputSearchSource(key: []const u8) []const u8 {
+    const first = findByte(key, 0) orelse return key;
+    const second = std.mem.findScalarPos(u8, key, first + 1, 0) orelse return key;
+    return key[0..second];
+}
+
+/// The search a `.output_search` key names, after its source.
+fn outputSearchQuery(key: []const u8) []const u8 {
+    const source = outputSearchSource(key);
+    return if (source.len < key.len) key[source.len + 1 ..] else "";
+}
+
+const SavedReadWords = struct { verb: []const u8, target: []const u8 };
+
+/// The words core names a read of saved output with, from its arguments: its
+/// verb for whether it still runs, such as "Searching", "Searched", or
+/// "Cancelled", and what it reads when no call names the output, such as
+/// "more output". Null for a call that failed or was denied, whose row core
+/// words, and for arguments that name no request.
+fn savedReadWords(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?SavedReadWords {
+    if (!std.mem.eql(u8, record.tool_name, "read_tool_result") or storyCallFailed(record)) return null;
+    const State = enum { running, done, cancelled };
+    const state: State = if (record.outcome) |outcome| switch (outcome) {
+        .completed => .done,
+        .cancelled => .cancelled,
+        else => return null,
+    } else .running;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch, record.arguments_json orelse return null, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    const words = read_tool_result_presentation.presentation(parsed.object) orelse return null;
+    const verb = switch (state) {
+        .running => words.action_label,
+        .done => words.completed_action_label,
+        .cancelled => cancelled_label,
+    };
+    return .{ .verb = verb, .target = words.label_arg_default };
+}
+
+/// The verb a row of reads of saved output leads with: its newest call's,
+/// as that call's own row would say it, else `fallback`.
+fn savedReadVerb(scratch: std.mem.Allocator, row: *const StoryRow, fallback: []const u8) ![]const u8 {
+    const record = row.detail orelse return fallback;
+    const words = try savedReadWords(scratch, record) orelse return fallback;
+    return words.verb;
+}
+
+/// "Searched github.com output for ": what a row of searches of one saved
+/// output says before the searches.
+fn outputSearchHead(scratch: std.mem.Allocator, verb: []const u8, key: []const u8) ![]const u8 {
+    return std.mem.concat(scratch, u8, &.{ verb, " ", try terminalSafeText(scratch, moreOutputShortName(key)), searched_output_marker });
+}
+
+/// What a row of reads of saved output names after its verb, such as
+/// "github.com output for "npx"" or "more output from SKILL.md".
+fn savedOutputRowTarget(scratch: std.mem.Allocator, identity: StoryIdentity) ![]const u8 {
+    const source = try terminalSafeText(scratch, moreOutputShortName(identity.key));
+    return switch (identity.kind) {
+        .output_search => std.mem.concat(scratch, u8, &.{ source, searched_output_marker, outputSearchQuery(identity.key) }),
+        else => std.mem.concat(scratch, u8, &.{ more_output_marker, source }),
+    };
+}
+
+/// A read of saved output in its finished row's words from the moment its
+/// arguments arrive: its verb for whether it still runs, then what it reads,
+/// with the source by its short name, such as "Searching github.com output
+/// for "npx"", "Read more output from SKILL.md", "Opened tool call T5", or
+/// "Cancelled github.com output for "npx"". Core's row names the call's
+/// handle while the call streams in, and says "earlier" before a record,
+/// which the compact row leaves out. Null for any other row.
+fn savedReadRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
+    const record = row.detail orelse return null;
+    const words = try savedReadWords(scratch, record) orelse return null;
+    const target = switch (row.identity.kind) {
+        .more_output, .output_search => try savedOutputRowTarget(scratch, row.identity),
+        .single => if (row.identity.key.len > 0)
+            row.identity.key
+        else
+            try read_tool_result_presentation.openedRecordName(scratch, record.arguments_json.?) orelse words.target,
+        else => return null,
+    };
+    return try std.mem.concat(scratch, u8, &.{ words.verb, " ", target });
+}
+
+/// A web page an earlier turn fetched and saved behind a handle, which the
+/// searches in the tests below look into.
+const saved_page_for_test = ToolDetailRecord{
+    .entry_id = 90,
+    .tool_name = @constCast("web_fetch"),
+    .activity_kind = .read,
+    .arguments_json = @constCast("{\"url\":\"https://github.com/example/project\"}"),
+    .outcome = .completed,
+    .result_handle = @constCast("result-14acc.txt"),
+};
+
+/// A search of that page for `query`, still streaming in when `outcome` is
+/// null.
+fn savedSearchForTest(entry_id: u32, comptime query: []const u8, outcome: ?types.ToolOutcomeKind) ToolDetailRecord {
+    const arguments = "{\"handle\":\"result-14acc.txt\",\"query\":\"" ++ query ++ "\"}";
+    return .{ .entry_id = entry_id, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(arguments), .outcome = outcome, .streaming = outcome == null };
+}
+
+test "searches of one saved output share one row that names the source by its short name and each search once" {
+    const alloc = std.testing.allocator;
+    const page = "https://github.com/example/project";
+    const finished = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched " ++ page ++ " output for \"npx\"\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched " ++ page ++ " output for \" fx\"\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Searched " ++ page ++ " output for \"terminal\"\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        saved_page_for_test,
+        savedSearchForTest(1, "npx", .completed),
+        savedSearchForTest(2, " fx", .completed),
+        savedSearchForTest(3, "terminal", .completed),
+    };
+    const text = try groupTextForTest(alloc, &finished, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("finished:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings("● Searched github.com output for \"npx\", \" fx\", \"terminal\"", std.mem.trim(u8, text, "\n"));
+
+    // Searches of two outputs keep a row each.
+    const other = [_]TranscriptEntry{
+        finished[0],
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Searched /w/notes.md output for \"todo\"\n", .class = .tool_status } },
+        finished[1],
+    };
+    const other_details = [_]ToolDetailRecord{
+        saved_page_for_test,
+        .{ .entry_id = 91, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/notes.md\"}"), .outcome = .completed, .result_handle = @constCast("result-2222.txt") },
+        savedSearchForTest(1, "npx", .completed),
+        .{ .entry_id = 4, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-2222.txt\",\"query\":\"todo\"}"), .outcome = .completed },
+        savedSearchForTest(2, " fx", .completed),
+    };
+    const two = try groupTextForTest(alloc, &other, &other_details);
+    defer alloc.free(two);
+    errdefer std.debug.print("two outputs:\n{s}\n", .{two});
+    try std.testing.expect(std.mem.find(u8, two, "├ Searched github.com output for \"npx\", \" fx\"\n") != null);
+    try std.testing.expect(std.mem.find(u8, two, "└ Searched notes.md output for \"todo\"") != null);
+    try std.testing.expect(std.mem.find(u8, two, page) == null);
+
+    // A row too narrow for every search counts the older ones first.
+    var narrow = try build(alloc, &finished, &details, 54);
+    defer narrow.deinit(alloc);
+    const narrow_row = std.mem.trimEnd(u8, narrow.entry_actions.items[0].override.bytes, "\n");
+    errdefer std.debug.print("narrow: {s}\n", .{narrow_row});
+    try std.testing.expectEqualStrings("● Searched github.com output for +1, \" fx\", \"terminal\"", narrow_row);
+
+    // A search of wide characters counts each by its two columns.
+    var wide_details = details;
+    wide_details[3] = savedSearchForTest(3, "検索語", .completed);
+    var wide = try build(alloc, &finished, &wide_details, 54);
+    defer wide.deinit(alloc);
+    const wide_row = std.mem.trimEnd(u8, wide.entry_actions.items[0].override.bytes, "\n");
+    errdefer std.debug.print("wide: {s}\n", .{wide_row});
+    try std.testing.expectEqualStrings("● Searched github.com output for +1, \" fx\", \"検索語\"", wide_row);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide_row) <= 54);
+}
+
+test "a search of a long command's saved output names the command by the short form its own row shows" {
+    const alloc = std.testing.allocator;
+    const command = "gh api repos/vercel-labs/fx-factory/git/trees/HEAD?recursive=1 --jq '.tree[] | \"\\(.type)\\t\\(.path)\"'";
+    const replay = "fx-command-replay-5e1d-0b7a.bin";
+    const arguments = try std.json.Stringify.valueAlloc(alloc, .{ .command = command }, .{});
+    defer alloc.free(arguments);
+    const search_arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"blob\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched " ++ command ++ " output for \"blob\"\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, arguments, 0, null),
+        .{ .entry_id = 2, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(search_arguments), .outcome = .completed },
+    };
+    details[0].command_display = @constCast(command);
+    details[0].command_artifact_handle = @constCast(replay);
+    // The search finds the command by the output it saved, and again by
+    // core's row alone, as when the command is not in view.
+    for ([_]?[]u8{ details[0].command_artifact_handle, null }) |handle| {
+        details[0].command_artifact_handle = handle;
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("search of a command's output:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "├ Ran gh api\n") != null);
+        try std.testing.expect(std.mem.find(u8, text, "└ Searched gh api output for \"blob\"") != null);
+        try std.testing.expect(std.mem.find(u8, text, "fx-factory") == null);
+    }
+}
+
+test "a look into saved output has its finished row's words and name from the moment its arguments arrive" {
+    const alloc = std.testing.allocator;
+    // While the model streams the three calls in, core's rows name the
+    // handle, the first text in each call's arguments.
+    const streaming = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Reading result-14acc.txt\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Reading result-14acc.txt\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Reading result-14acc.txt\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        saved_page_for_test,
+        savedSearchForTest(1, "npx", null),
+        savedSearchForTest(2, " fx", null),
+        savedSearchForTest(3, "terminal", null),
+    };
+    const text = try groupTextForTest(alloc, &streaming, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("streaming:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings("● Searching github.com output for \"npx\", \" fx\", \"terminal\"", std.mem.trim(u8, text, "\n"));
+
+    // A command's output that no call in view saved, and a saved record.
+    const Case = struct { phrase: []const u8, arguments: []const u8, outcome: ?types.ToolOutcomeKind, row: []const u8 };
+    const replay = "fx-command-replay-2f7c86d07623-28a7.bin";
+    const cases = [_]Case{
+        .{ .phrase = "● Reading " ++ replay ++ "\n", .arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"FUZZ_\"}", .outcome = null, .row = "● Searching command output for \"FUZZ_\"" },
+        .{ .phrase = "● Searching command output for \"FUZZ_\"\n", .arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"FUZZ_\"}", .outcome = null, .row = "● Searching command output for \"FUZZ_\"" },
+        .{ .phrase = "● Searched command output for \"FUZZ_\"\n", .arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"FUZZ_\"}", .outcome = .completed, .row = "● Searched command output for \"FUZZ_\"" },
+        .{ .phrase = "● Reading T5\n", .arguments = "{\"handle\":\"T5\"}", .outcome = null, .row = "● Opening tool call T5" },
+        .{ .phrase = "● Opened earlier tool call T5\n", .arguments = "{\"handle\":\"T5\"}", .outcome = .completed, .row = "● Opened tool call T5" },
+        .{ .phrase = "● Reading result-14acc.txt\n", .arguments = "{\"handle\":\"result-14acc.txt\",\"start_byte\":4096}", .outcome = null, .row = "● Reading more output from github.com" },
+    };
+    for (cases) |case| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
+        const case_details = [_]ToolDetailRecord{
+            saved_page_for_test,
+            .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(case.arguments), .outcome = case.outcome, .streaming = case.outcome == null },
+        };
+        const row = try groupTextForTest(alloc, &entries, &case_details);
+        defer alloc.free(row);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.phrase, row });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, row, "\n"));
+    }
+}
+
+test "a cancelled look into saved output names what it read as its running row does" {
+    const alloc = std.testing.allocator;
+    // Escape while the model streamed the first call in, when core's row
+    // names its handle, and after the second started, when core names the
+    // page in full.
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled result-14acc.txt" ++ cancellation_follow_up, .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled https://github.com/example/project output for \"terminal\"" ++ cancellation_follow_up, .class = .tool_status } },
+    };
+    var streamed = savedSearchForTest(1, "npx", .cancelled);
+    streamed.streaming = true;
+    const details = [_]ToolDetailRecord{ saved_page_for_test, streamed, savedSearchForTest(2, "terminal", .cancelled) };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("cancelled:\n{s}\n", .{text});
+    // Each keeps its own row, and its notice names it as the row does.
+    try std.testing.expect(std.mem.find(u8, text, "├ Cancelled github.com output for \"npx\"\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled github.com output for \"terminal\"\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled github.com output for \"npx\"" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled github.com output for \"terminal\"" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "result-14acc") == null);
+    try std.testing.expect(std.mem.find(u8, text, "https://") == null);
+
+    // A read of more output and a record, each cancelled as it streamed in.
+    const Case = struct { handle: []const u8, arguments: []const u8, row: []const u8 };
+    const cases = [_]Case{
+        .{ .handle = "result-14acc.txt", .arguments = "{\"handle\":\"result-14acc.txt\",\"start_byte\":4096}", .row = "Cancelled more output from github.com" },
+        .{ .handle = "T5", .arguments = "{\"handle\":\"T5\"}", .row = "Cancelled tool call T5" },
+    };
+    for (cases) |case| {
+        const phrase = try std.mem.concat(alloc, u8, &.{ "▪ Cancelled ", case.handle, cancellation_follow_up });
+        defer alloc.free(phrase);
+        const one = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = phrase, .class = .tool_status } }};
+        const one_details = [_]ToolDetailRecord{
+            saved_page_for_test,
+            .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(case.arguments), .outcome = .cancelled, .streaming = true },
+        };
+        const row = try groupTextForTest(alloc, &one, &one_details);
+        defer alloc.free(row);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.arguments, row });
+        const header = try std.mem.concat(alloc, u8, &.{ "● ", case.row, "\n" });
+        defer alloc.free(header);
+        const notice = try std.mem.concat(alloc, u8, &.{ "▪ ", case.row, cancellation_follow_up });
+        defer alloc.free(notice);
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, row, "\n"), header));
+        try std.testing.expect(std.mem.find(u8, row, notice) != null);
+    }
 }
 
 /// A read row by the file's name and the lines it read, such as
-/// "Read orchestrator.zig L15-200", in place of the whole path. An absolute
-/// path makes the name a file link, so Cmd+click opens the file. Null when
+/// "Read orchestrator.zig L15-200", in place of the whole path. The name
+/// links to the file (`writeFileName`), so Cmd+click opens it. Null when
 /// the phrase does not end with the path the call read.
 fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow, merged: bool) !?[]const u8 {
     const record = row.detail orelse return null;
@@ -2469,7 +3231,7 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     if (std.Io.Dir.path.basename(named.path).len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(named.label);
-    try writeFileName(&out.writer, named.path);
+    try writeFileName(&out.writer, named.path, .{ .resolved = readLink(row, row.identity.key) });
     if (!merged) {
         // "L15-200" for a start and a count, "L15+" for a start alone, and
         // "L1-200" for a count alone.
@@ -2492,8 +3254,11 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
 /// path cut short. Null for a row of one call whose phrase does not end with
 /// the path it changed and its counts.
 fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
-    if (!entryShowsDiffStats(row.detail)) return null;
-    const path = storyArgString(scratch, row.detail.?, "path") orelse return try pendingPathPhrase(scratch, phrase, row.detail.?);
+    const change = try fileChangeOf(scratch, row.detail) orelse return null;
+    const record = row.detail.?;
+    const path = jsonArgString(scratch, change.arguments, "path") orelse
+        statusFilePath(record, phrase) orelse
+        return try pendingPathPhrase(scratch, phrase, record);
     // Core writes the path terminal-safe, so a control byte in it shows
     // escaped.
     const shown = try terminalSafeText(scratch, path);
@@ -2510,7 +3275,9 @@ fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     const totals = if (merged) row.diff else diffTotalsOfPhrase(phrase);
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(target.label);
-    try writeFileName(&out.writer, target.path);
+    // The link goes to the file the change wrote, which a symlink or "./"
+    // in the path the call named does not hide.
+    try writeFileName(&out.writer, target.path, .{ .resolved = row.resolved_path });
     if (totals.added > 0) try out.writer.print(" +{d}", .{totals.added});
     if (totals.removed > 0) try out.writer.print("{s}-{d}", .{ if (totals.added > 0) "/" else " ", totals.removed });
     return out.written();
@@ -2539,7 +3306,8 @@ fn phrasePath(phrase: []const u8, path: []const u8, shown: []const u8) ?PhrasePa
 /// already names the path after its one-word verb, such as "Reading
 /// /src/main.zig". Null once the call has arguments, which name the path
 /// instead, or an outcome, whose phrase can end in counts, and when the
-/// phrase names no folder to leave out.
+/// phrase names no folder to leave out. Core has not resolved the path yet,
+/// so the name has no link.
 fn pendingPathPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) !?[]const u8 {
     if (record.outcome != null or storyHasArgs(record)) return null;
     const space = findByte(phrase, ' ') orelse return null;
@@ -2547,7 +3315,7 @@ fn pendingPathPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
     if (findByte(path, '/') == null or std.Io.Dir.path.basename(path).len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(phrase[0 .. space + 1]);
-    try writeFileName(&out.writer, path);
+    try writeFileName(&out.writer, path, .{});
     return out.written();
 }
 
@@ -2570,46 +3338,214 @@ fn linkOpensSafely(name: []const u8) bool {
     return true;
 }
 
-/// A file by its name, in place of its whole path. An absolute path to a
-/// file that opens safely makes the name a file link, so Cmd+click opens
-/// the file. A path with no name shows whole. The text is terminal-safe.
-fn writeFileName(writer: *std.Io.Writer, path: []const u8) !void {
+/// Where a file name's link points.
+const FileLink = struct {
+    /// The file core resolved the call's path to, with symlinks followed
+    /// (`ToolDetailRecord.resolved_path`). The link never takes the path the
+    /// model named: a symlink there can point to a program.
+    resolved: ?[]const u8 = null,
+};
+
+/// The absolute path a file name links to: the path core resolved. Null
+/// when core resolved none, or when the path is relative, cut short with
+/// "…", or holds a backslash, as core escapes a path it writes as text, so
+/// it may name another file.
+fn fileLinkTarget(link: FileLink) ?[]const u8 {
+    const target = link.resolved orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(target)) return null;
+    if (std.mem.find(u8, target, "…") != null or findByte(target, '\\') != null) return null;
+    return target;
+}
+
+/// A file by its name, in place of its whole path. The name links to the
+/// file core resolved (`fileLinkTarget`), so Cmd+click opens it, when both
+/// the name and that file open safely. A path with no name shows whole. The
+/// text is terminal-safe, and the link's path is percent-encoded.
+fn writeFileName(writer: *std.Io.Writer, path: []const u8, link: FileLink) !void {
     const base = std.Io.Dir.path.basename(path);
     const name = if (base.len == 0) path else base;
-    const link = base.len > 0 and std.Io.Dir.path.isAbsolute(path) and linkOpensSafely(base);
-    if (link) {
+    const target = if (base.len > 0 and linkOpensSafely(base)) fileLinkTarget(link) else null;
+    // The file the link opens can have another name than the row shows,
+    // such as a symlink's target, which must open safely too.
+    const opens = if (target) |absolute| linkOpensSafely(std.Io.Dir.path.basename(absolute)) else false;
+    if (opens) {
         try writer.writeAll("\x1b]8;;file://");
-        try writeFileUrlPath(writer, path);
+        try writeFileUrlPath(writer, target.?);
         try writer.writeAll("\x1b\\");
     }
     try writeTerminalSafe(writer, name);
-    if (link) try writer.writeAll(link_close);
+    if (opens) try writer.writeAll(link_close);
 }
 
-/// The text of a row that names several files or patterns: its past verb,
-/// how many older names do not fit, then the newest names that fit in `cols`
-/// after the row's two-column connector, oldest first, such as
-/// "Read +3, c.zig, d.zig". The last name is the newest call's, which may
-/// still run. At least one name shows; the row clips it when even that one
-/// is too wide. Ctrl+O shows every call.
+test "a file name links only to the file core resolved, when that file opens safely" {
+    var out_buf: [512]u8 = undefined;
+    const Case = struct { path: []const u8, link: FileLink = .{}, want: []const u8 };
+    const cases = [_]Case{
+        .{ .path = "tsec/selfhost/checker.tse", .link = .{ .resolved = "/Users/example/my ws/tsec/selfhost/checker.tse" }, .want = "\x1b]8;;file:///Users/example/my%20ws/tsec/selfhost/checker.tse\x1b\\checker.tse" ++ link_close },
+        // The path the model named is never the link: it can be a symlink to
+        // a program.
+        .{ .path = "docs/plan.md", .want = "plan.md" },
+        .{ .path = "/opt/notes/plan.md", .want = "plan.md" },
+        // A symlink's name links to the file it points to, and to nothing
+        // when that file could run on a click or has no extension.
+        .{ .path = "notes.md", .link = .{ .resolved = "/Users/example/ws/real/real.md" }, .want = "\x1b]8;;file:///Users/example/ws/real/real.md\x1b\\notes.md" ++ link_close },
+        .{ .path = "notes.md", .link = .{ .resolved = "/Users/example/ws/run.command" }, .want = "notes.md" },
+        .{ .path = "notes.md", .link = .{ .resolved = "/Users/example/ws/bin/tool" }, .want = "notes.md" },
+        // A name that could run gets no link, wherever it points.
+        .{ .path = "tools/install.command", .link = .{ .resolved = "/Users/example/ws/tools/real.md" }, .want = "install.command" },
+        .{ .path = "bin/fx", .link = .{ .resolved = "/Users/example/ws/bin/fx" }, .want = "fx" },
+        // A path out of the folder links where core resolved it.
+        .{ .path = "../notes/plan.md", .link = .{ .resolved = "/Users/example/notes/plan.md" }, .want = "\x1b]8;;file:///Users/example/notes/plan.md\x1b\\plan.md" ++ link_close },
+        .{ .path = "/tmp/plan.md", .link = .{ .resolved = "/private/tmp/plan.md" }, .want = "\x1b]8;;file:///private/tmp/plan.md\x1b\\plan.md" ++ link_close },
+        // A relative path, from a session that may have run in another
+        // workspace, can name another file here; a path core cut short or
+        // escaped names no file.
+        .{ .path = "docs/plan.md", .link = .{ .resolved = "docs/plan.md" }, .want = "plan.md" },
+        .{ .path = "docs/plan.md", .link = .{ .resolved = "/Users/example/ws/very…/plan.md" }, .want = "plan.md" },
+        .{ .path = "docs/plan.md", .link = .{ .resolved = "/Users/example/ws/docs/pl\\x1ban.md" }, .want = "plan.md" },
+        // Escape bytes in a name stay escaped, and the link encodes them.
+        .{ .path = "docs/a\x1b]8;;evil\x07.md", .link = .{ .resolved = "/Users/example/my ws/docs/a\x1b]8;;evil\x07.md" }, .want = "\x1b]8;;file:///Users/example/my%20ws/docs/a%1B%5D8%3B%3Bevil%07.md\x1b\\a\\x1b]8;;evil\\x07.md" ++ link_close },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer = .fixed(&out_buf);
+        try writeFileName(&out, case.path, case.link);
+        errdefer std.debug.print("path {s}: {s}\n", .{ case.path, out.buffered() });
+        try std.testing.expectEqualStrings(case.want, out.buffered());
+    }
+}
+
+/// A group's painted rows, joined by "\n".
+fn paintedGroupForTest(gpa: std.mem.Allocator, entries: []const TranscriptEntry, details: []const ToolDetailRecord, cols: u16) ![]u8 {
+    var group = try buildStyled(gpa, entries, details, cols, .{}, .{});
+    defer group.deinit(gpa);
+    var painted: std.ArrayList(u8) = .empty;
+    errdefer painted.deinit(gpa);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(gpa, override.bytes);
+            try painted.append(gpa, '\n');
+        },
+        else => {},
+    };
+    return painted.toOwnedSlice(gpa);
+}
+
+test "compact rows link read, edit, and write names to the files core resolved, without changing what they show" {
+    const alloc = std.testing.allocator;
+    const root = "/Users/example/ws";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited docs/spec.md +10 / -9\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote docs/ledger.md +1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read src/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Read src/b.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"docs/spec.md\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .resolved_path = @constCast(root ++ "/docs/spec.md"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast("{\"path\":\"docs/ledger.md\",\"content\":\"x\"}"), .resolved_path = @constCast(root ++ "/docs/ledger.md"), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"src/a.zig\"}"), .resolved_path = @constCast(root ++ "/src/a.zig"), .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"src/b.zig\"}"), .resolved_path = @constCast(root ++ "/src/b.zig"), .outcome = .completed },
+    };
+    var unresolved = details;
+    for (&unresolved) |*detail| detail.resolved_path = null;
+    for ([_]u16{ 120, 28 }) |cols| {
+        const linked = try paintedGroupForTest(alloc, &entries, &details, cols);
+        defer alloc.free(linked);
+        const plain = try paintedGroupForTest(alloc, &entries, &unresolved, cols);
+        defer alloc.free(plain);
+        errdefer std.debug.print("cols {d}:\n{s}\n", .{ cols, linked });
+        // The links add no cells: the rows read and clip as they did.
+        const linked_text = try visibleLinesForTest(alloc, linked, cols);
+        defer alloc.free(linked_text);
+        const plain_text = try visibleLinesForTest(alloc, plain, cols);
+        defer alloc.free(plain_text);
+        try std.testing.expectEqualStrings(plain_text, linked_text);
+        // With no path core resolved, no name links.
+        try std.testing.expect(std.mem.find(u8, plain, "\x1b]8;") == null);
+        // A cut row closes every link it opens.
+        var lines = std.mem.splitScalar(u8, linked, '\n');
+        while (lines.next()) |line| try std.testing.expect(!endsInsideLink(line));
+        if (cols < 120) continue;
+        try std.testing.expect(std.mem.find(u8, linked_text, "├ Edited spec.md +10/-9\n") != null);
+        try std.testing.expect(std.mem.find(u8, linked_text, "├ Wrote ledger.md +1\n") != null);
+        try std.testing.expect(std.mem.find(u8, linked_text, "└ Read a.zig, b.zig") != null);
+        for ([_][]const u8{ "docs/spec.md\x1b\\spec.md", "docs/ledger.md\x1b\\ledger.md", "src/a.zig\x1b\\a.zig", "src/b.zig\x1b\\b.zig" }) |target| {
+            const want = try std.mem.concat(alloc, u8, &.{ "\x1b]8;;file://" ++ root ++ "/", target, link_close });
+            defer alloc.free(want);
+            try std.testing.expect(std.mem.find(u8, linked, want) != null);
+        }
+    }
+}
+
+test "a read row links to the file core read, never to the symlink the model named" {
+    const alloc = std.testing.allocator;
+    // In the workspace, notes.md -> run.command (a script), link.md ->
+    // real/real.md, and gone.md -> a file that does not exist.
+    const notes = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"notes.md\"}"), .resolved_path = @constCast("/ws/run.command"), .outcome = .completed };
+    const link = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"link.md\"}"), .resolved_path = @constCast("/ws/real/real.md"), .outcome = .completed };
+    const gone = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"gone.md\"}"), .outcome = .failed };
+    const notes_entry = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Read notes.md\n", .class = .tool_status } };
+    const link_entry = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Read link.md\n", .class = .tool_status } };
+    const gone_entry = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Couldn't read gone.md · Path not found: gone.md\n", .class = .tool_status } };
+    const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, links: []const []const u8 };
+    const cases = [_]Case{
+        .{ .entries = &.{notes_entry}, .details = &.{notes}, .links = &.{} },
+        .{ .entries = &.{link_entry}, .details = &.{link}, .links = &.{"\x1b]8;;file:///ws/real/real.md\x1b\\link.md" ++ link_close} },
+        .{ .entries = &.{gone_entry}, .details = &.{gone}, .links = &.{} },
+        // In one row's list of names, each name keeps its own file.
+        .{ .entries = &.{ notes_entry, link_entry, gone_entry }, .details = &.{ notes, link, gone }, .links = &.{"\x1b]8;;file:///ws/real/real.md\x1b\\link.md" ++ link_close} },
+    };
+    for (cases) |case| {
+        const painted = try paintedGroupForTest(alloc, case.entries, case.details, 120);
+        defer alloc.free(painted);
+        errdefer std.debug.print("rows:\n{s}\n", .{painted});
+        try std.testing.expectEqual(case.links.len, std.mem.count(u8, painted, "\x1b]8;;file://"));
+        for (case.links) |want| try std.testing.expect(std.mem.find(u8, painted, want) != null);
+        try std.testing.expect(std.mem.find(u8, painted, "notes.md\x1b]8;;") == null);
+    }
+    // A running read has no resolved path yet, so no link.
+    var running = link;
+    running.outcome = null;
+    const painted = try paintedGroupForTest(alloc, &.{.{ .raw_bytes = .{ .id = 2, .bytes = "● Reading link.md\n", .class = .tool_status } }}, &.{running}, 120);
+    defer alloc.free(painted);
+    try std.testing.expect(std.mem.find(u8, painted, "\x1b]8;") == null);
+}
+
+/// The text of a row that names several files, patterns, sources, or
+/// searches: what they did, how many older names do not fit, then the
+/// newest names that fit in `cols` after the row's two-column connector,
+/// oldest first, such as "Read +3, c.zig, d.zig". The last name is the
+/// newest call's, which may still run. At least one name shows; the row
+/// clips it when even that one is too wide. Ctrl+O shows every call.
 fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) !StoryRowText {
-    const is_read = row.identity.kind == .read;
-    const is_more = row.identity.kind == .more_output;
-    const tool = if (is_read) "read_file" else if (is_more) "read_tool_result" else storySearchTool(row.identity.key);
-    // The row stands for every call it names, so it says what they did, even
-    // while the newest still runs.
-    const verb = if (is_read) "Read" else if (is_more) "Read more output from" else if (std.mem.eql(u8, tool, "glob_files")) "Matched" else "Searched";
+    const kind = row.identity.kind;
+    // A row of reads or searches stands for every call it names, so it says
+    // what they did, even while the newest still runs. A row of reads of
+    // saved output says what its newest call does, as that call's own row
+    // does.
+    const head = switch (kind) {
+        .read => "Read ",
+        .more_output => try std.mem.concat(scratch, u8, &.{ try savedReadVerb(scratch, row, "Read"), " ", more_output_marker }),
+        .output_search => try outputSearchHead(scratch, try savedReadVerb(scratch, row, "Searched"), row.identity.key),
+        else => if (std.mem.eql(u8, storySearchTool(row.identity.key), "glob_files")) "Matched " else "Searched ",
+    };
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
     const names = row.names.items;
     const pieces = try scratch.alloc([]const u8, names.len);
     for (names, pieces) |name, *piece| {
         var text: std.Io.Writer.Allocating = .init(scratch);
-        if (is_read) try writeFileName(&text.writer, name) else try writeTerminalSafe(&text.writer, if (is_more) moreOutputShortName(name) else name);
+        switch (kind) {
+            .read => try writeFileName(&text.writer, name, .{ .resolved = readLink(row, name) }),
+            .more_output => try writeTerminalSafe(&text.writer, moreOutputShortName(name)),
+            // Core quotes a search terminal-safe.
+            .output_search => try text.writer.writeAll(name),
+            else => try writeTerminalSafe(&text.writer, name),
+        }
         piece.* = text.written();
     }
     // The most names, counted from the newest, whose row fits.
-    const head_width = verb.len + 1;
+    const head_width = display_width.visibleWidthIgnoringAnsi(head);
     var shown: usize = 0;
     var names_width: usize = 0;
     while (shown < names.len) {
@@ -2622,8 +3558,7 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
     }
 
     var body: std.Io.Writer.Allocating = .init(scratch);
-    try body.writer.writeAll(verb);
-    try body.writer.writeByte(' ');
+    try body.writer.writeAll(head);
     if (shown < names.len) try writeCount(&body.writer, "+", names.len - shown, ", ");
     for (pieces[names.len - shown ..], 0..) |piece, position| {
         if (position > 0) try body.writer.writeAll(", ");
@@ -2732,6 +3667,26 @@ fn shellRetryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?
     return try std.mem.concat(scratch, u8, &.{ "shell\x00", short });
 }
 
+/// Whether one of an edit row's calls named its file as `path`.
+fn namedFileBefore(row: *const StoryRow, path: []const u8) bool {
+    for (row.named_paths.items) |named| if (std.mem.eql(u8, named, path)) return true;
+    return false;
+}
+
+/// The identity of a completed edit or write whose record kept no path, by
+/// the file its status names, so it joins that file's row as a call with
+/// its path would. Any other call keeps `identity`.
+fn statusFileIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    if (identity.kind != .single) return identity;
+    const record = detail orelse return identity;
+    // A running call waits in its file's row instead (`pendingCallRow`).
+    if (record.outcome != .completed) return identity;
+    const change = try fileChangeOf(scratch, detail) orelse return identity;
+    if (jsonArgString(scratch, change.arguments, "path") != null) return identity;
+    const path = statusFilePath(record, try entryStatus(scratch, entry) orelse return identity) orelse return identity;
+    return try fileChangeIdentity(scratch, record, path);
+}
+
 /// A running toolbox call's identity by the MCP tool its status names, such
 /// as "Running MCP mcp_x", while its arguments, which name the tool, have
 /// not arrived, so it joins that tool's row at once instead of showing on a
@@ -2747,6 +3702,384 @@ fn streamingToolboxIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, 
     const name = std.mem.trim(u8, phrase[prefix.len..], " \t\r\n");
     if (name.len == 0) return identity;
     return .{ .kind = .mcp, .key = name };
+}
+
+/// How an MCP call's result starts: the server it ran on comes first
+/// (`write_envelope` in src/core/mcp/tool_result.zig).
+const mcp_result_server_field = "{\"server\":";
+
+/// The server an MCP call's result names. Null for any other call and for a
+/// result that names none, such as a failure fx reported itself.
+fn mcpResultServer(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    if (record.activity_kind != .mcp) return null;
+    const result = record.result orelse return null;
+    if (!std.mem.startsWith(u8, result, mcp_result_server_field)) return null;
+    // A result cut short still names the server whole, since it comes first.
+    const value = fieldValue(scratch, result, mcp_result_server_field.len) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return switch (value) {
+        .string => |server| if (server.len > 0) server else null,
+        else => null,
+    };
+}
+
+/// Whether `text` starts with `segment`, then "_" and more.
+fn startsWithSegment(text: []const u8, segment: []const u8) bool {
+    return segment.len > 0 and text.len > segment.len + 1 and std.mem.startsWith(u8, text, segment) and text[segment.len] == '_';
+}
+
+/// `server` as an MCP tool's alias spells it (`buildBaseToolName` in
+/// src/core/mcp/tool_names.zig).
+fn mcpAliasSegment(scratch: std.mem.Allocator, server: []const u8) ![]const u8 {
+    const segment = try scratch.dupe(u8, server);
+    for (segment) |*byte| if (!mcp_tool_names.isIdentifierByte(byte.*)) {
+        byte.* = '_';
+    };
+    return segment;
+}
+
+/// The most bytes in an MCP tool's alias. Core cuts a longer one there
+/// (`candidateWithSuffix` in src/core/mcp/tool_names.zig), so an alias that
+/// long may have lost the end of its tool's name.
+const max_mcp_alias_bytes = 64;
+
+/// What an MCP row says for a tool whose server or name it cannot be sure of.
+const unnamed_mcp_tool = "an MCP tool";
+
+const McpToolParts = struct {
+    server: []const u8,
+    tool: []const u8,
+    /// Whether the alias can only be this server's tool. Without the server
+    /// a result names, the alias shows where the server's name ends only
+    /// when one "_" follows "mcp_": with more, the name may hold some, as
+    /// "my_srv" and "Team notes" do (`buildBaseToolName` in
+    /// src/core/mcp/tool_names.zig). An alias core cut short may also have
+    /// lost the end of the tool's name.
+    certain: bool,
+};
+
+/// An MCP tool's server and the tool's own name, from its alias
+/// `mcp_<server>_<tool>`: "slack" and "read_thread" for slack's
+/// slack_read_thread. A tool name that repeats its server's name, as many do,
+/// leaves it out. `server` is the server the call's result names, or "" when
+/// none does, and then the alias up to its first "_" names the server. Null
+/// for a name that is no alias, such as another program's "mcp__server__tool".
+fn mcpToolParts(scratch: std.mem.Allocator, alias: []const u8, server: []const u8) !?McpToolParts {
+    if (!types.isMcpToolName(alias)) return null;
+    const rest = alias[types.mcp_tool_prefix.len..];
+    const named = try mcpAliasSegment(scratch, server);
+    const known = startsWithSegment(rest, named);
+    const server_segment = if (known) named else rest[0 .. findByte(rest, '_') orelse return null];
+    if (server_segment.len == 0) return null;
+    var tool = rest[server_segment.len + 1 ..];
+    if (startsWithSegment(tool, server_segment)) tool = tool[server_segment.len + 1 ..];
+    if (tool.len == 0) return null;
+    return .{
+        .server = if (known) server else server_segment,
+        .tool = tool,
+        .certain = (known or std.mem.count(u8, rest, "_") == 1) and alias.len < max_mcp_alias_bytes,
+    };
+}
+
+/// An MCP tool in words: its server once, with its first letter in upper
+/// case, then what the tool does, as "Slack to read thread" for slack's
+/// slack_read_thread and "Linear to get issue" for linear's getIssue.
+/// "an MCP tool" when the alias could be another server's tool or lost the
+/// end of its name, so the row never names the wrong one. Terminal-safe.
+/// Null for a name that is no alias (`mcpToolParts`).
+fn mcpToolWords(scratch: std.mem.Allocator, alias: []const u8, server: []const u8) !?[]const u8 {
+    const parts = try mcpToolParts(scratch, alias, server) orelse return null;
+    if (!parts.certain) return unnamed_mcp_tool;
+    const words = try toolNameWords(scratch, parts.tool);
+    if (words.len == 0) return null;
+    const name = try scratch.dupe(u8, parts.server);
+    name[0] = std.ascii.toUpper(name[0]);
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, name), " to ", words });
+}
+
+/// An MCP tool in words from the names core gave it (`StoryRow.mcp_tool`),
+/// as `mcpToolWords` writes them, but sure of the server and whole: no
+/// alias cut short or `_2` it took for a name another tool had. Null when
+/// the tool's name leaves no words.
+fn namedMcpToolWords(scratch: std.mem.Allocator, name: types.McpToolName) !?[]const u8 {
+    if (name.server.len == 0) return null;
+    const tool = withoutServerName(name.tool, name.server);
+    const words = try toolNameWords(scratch, tool);
+    if (words.len == 0) return null;
+    const server = try scratch.dupe(u8, name.server);
+    server[0] = std.ascii.toUpper(server[0]);
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, server), " to ", try terminalSafeText(scratch, words) });
+}
+
+/// `tool` without its repeat of `server`'s name, as slack's slack_read_thread
+/// reads as read_thread: the bytes the alias would spell alike, with case
+/// ignored, then "_" and more.
+fn withoutServerName(tool: []const u8, server: []const u8) []const u8 {
+    if (tool.len <= server.len + 1 or tool[server.len] != '_') return tool;
+    for (server, tool[0..server.len]) |a, b| {
+        if (aliasByte(a) != aliasByte(b)) return tool;
+    }
+    return tool[server.len + 1 ..];
+}
+
+fn aliasByte(byte: u8) u8 {
+    return if (mcp_tool_names.isIdentifierByte(byte)) std.ascii.toLower(byte) else '_';
+}
+
+/// The words for an MCP row's tool: from core's names when it gave them,
+/// else from its alias (`mcpToolWords`).
+fn mcpRowWords(scratch: std.mem.Allocator, alias: []const u8, row: *const StoryRow) !?[]const u8 {
+    if (row.mcp_tool) |name| if (types.isMcpToolName(alias)) {
+        if (try namedMcpToolWords(scratch, name)) |words| return words;
+    };
+    return mcpToolWords(scratch, alias, row.mcp_server);
+}
+
+/// A tool's name as lower-case words: "read thread" for read_thread, and
+/// "get issue" for getIssue. An alias holds only letters, digits, "_", and
+/// "-" (`isIdentifierByte` in src/core/mcp/tool_names.zig).
+fn toolNameWords(scratch: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (name, 0..) |byte, index| {
+        const starts_word = std.ascii.isUpper(byte) and index > 0 and
+            (std.ascii.isLower(name[index - 1]) or std.ascii.isDigit(name[index - 1]) or
+                (std.ascii.isUpper(name[index - 1]) and index + 1 < name.len and std.ascii.isLower(name[index + 1])));
+        if (byte == '_' or starts_word) {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(scratch, ' ');
+            if (byte == '_') continue;
+        }
+        try out.append(scratch, std.ascii.toLower(byte));
+    }
+    return std.mem.trimEnd(u8, out.items, " ");
+}
+
+/// Core's labels that lead an MCP tool's row, and the compact row's for each.
+/// A call that did not run has a row of its own (`unrunMcpRowText`).
+const mcp_row_labels = [_]struct { core: []const u8, shown: []const u8 }{
+    .{ .core = tooling_presentation.mcp_ran_label ++ " ", .shown = "Used " },
+    .{ .core = tooling_presentation.mcp_running_label ++ " ", .shown = "Using " },
+    .{ .core = "Failed ", .shown = "Couldn't use " },
+    .{ .core = cancelled_label ++ " ", .shown = cancelled_label ++ " using " },
+};
+
+/// An MCP tool's row in words, such as "Used Slack to read thread" for
+/// core's "Ran MCP mcp_slack_slack_read_thread". Null for any other row.
+fn mcpRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
+    const record = row.detail orelse return null;
+    if (record.activity_kind != .mcp) return null;
+    for (mcp_row_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
+        const shown = try mcpRowWords(scratch, phrase[label.core.len..], row) orelse return null;
+        return try std.mem.concat(scratch, u8, &.{ label.shown, shown });
+    };
+    return null;
+}
+
+/// Core's labels for a call that did not run (`permissionDeniedStatusLabel`
+/// in src/core/agent/runtime/tool_admission.zig), and the note an MCP call's
+/// row ends with for each. The longest come first, so "Denied" does not take
+/// "Denied by auto agent".
+const mcp_unrun_labels = [_]struct { core: []const u8, note: []const u8 }{
+    .{ .core = "Denied by auto agent ", .note = " · denied by auto agent" },
+    .{ .core = "Denied ", .note = " · denied" },
+    .{ .core = "Review evidence incomplete ", .note = " · review evidence incomplete" },
+    .{ .core = "Review unavailable ", .note = " · review unavailable" },
+    .{ .core = "Permission required ", .note = " · permission required" },
+    .{ .core = safety_caution_label ++ " ", .note = safety_caution_note },
+};
+
+/// An MCP call that did not run, as "Didn't use Slack to read thread ·
+/// denied": what happened to the call, then why, as a held command reads.
+/// Null for any other row.
+fn unrunMcpRowText(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?StoryRowText {
+    const record = row.detail orelse return null;
+    if (record.outcome != .denied or record.activity_kind != .mcp) return null;
+    for (mcp_unrun_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
+        const words = try mcpRowWords(scratch, phrase[label.core.len..], row) orelse return null;
+        const body = try std.mem.concat(scratch, u8, &.{ "Didn't use ", words });
+        return .{ .display = try std.mem.concat(scratch, u8, &.{ body, label.note }), .body = body, .suffix = label.note };
+    };
+    return null;
+}
+
+test "an MCP tool's name reads as lower-case words" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_]struct { name: []const u8, words: []const u8 }{
+        .{ .name = "read_thread", .words = "read thread" },
+        .{ .name = "getIssue", .words = "get issue" },
+        .{ .name = "getHTTPStatus", .words = "get http status" },
+        .{ .name = "list__v2_items_", .words = "list v2 items" },
+        .{ .name = "take-screenshot", .words = "take-screenshot" },
+        .{ .name = "search", .words = "search" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.words, try toolNameWords(a, case.name));
+}
+
+test "MCP rows say in words which server's tool a call used" {
+    const alloc = std.testing.allocator;
+    const Case = struct { phrase: []const u8, run: []const u8, result: ?[]const u8, outcome: ?types.ToolOutcomeKind, row: []const u8 };
+    const cases = [_]Case{
+        // The tool repeats its server's name.
+        .{ .phrase = "● Ran MCP mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = "{\"server\":\"slack\",\"tool\":\"mcp_slack_slack_read_thread\",\"result\":{\"content\":[]}}", .outcome = .completed, .row = "● Used Slack to read thread" },
+        .{ .phrase = "● Ran MCP mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = "{\"server\":\"linear\",\"tool\":\"mcp_linear_get_issue\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"cut sho", .outcome = .completed, .row = "● Used Linear to get issue" },
+        .{ .phrase = "● Ran MCP mcp_chrome-devtools_take_screenshot\n", .run = "mcp_chrome-devtools_take_screenshot", .result = "{\"server\":\"chrome-devtools\",\"tool\":\"mcp_chrome-devtools_take_screenshot\",\"result\":{}}", .outcome = .completed, .row = "● Used Chrome-devtools to take screenshot" },
+        // A server whose name has a "_" or a space in it: the result names the server.
+        .{ .phrase = "● Ran MCP mcp_team_notes_search\n", .run = "mcp_team_notes_search", .result = "{\"server\":\"team notes\",\"tool\":\"mcp_team_notes_search\",\"result\":{}}", .outcome = .completed, .row = "● Used Team notes to search" },
+        .{ .phrase = "● Ran MCP mcp_my_srv_echo\n", .run = "mcp_my_srv_echo", .result = "{\"server\":\"my_srv\",\"tool\":\"mcp_my_srv_echo\",\"result\":{}}", .outcome = .completed, .row = "● Used My_srv to echo" },
+        // A server name the terminal would act on shows escaped.
+        .{ .phrase = "● Ran MCP mcp_bad_name_search\n", .run = "mcp_bad_name_search", .result = "{\"server\":\"bad\\u001bname\",\"tool\":\"mcp_bad_name_search\",\"result\":{}}", .outcome = .completed, .row = "● Used Bad\\x1bname to search" },
+        // With no result, a one-word server's alias has one "_" after "mcp_",
+        // so it can only be that server's tool.
+        .{ .phrase = "● Running MCP mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = null, .row = "● Using Linear to get issue" },
+        .{ .phrase = "● Ran MCP mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .completed, .row = "● Used Linear to get issue" },
+        .{ .phrase = "● Failed mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .failed, .row = "● Couldn't use Linear to get issue" },
+        // A call that did not run says so, then core's reason.
+        .{ .phrase = "● Denied mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · denied" },
+        .{ .phrase = "● Denied by auto agent mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · denied by auto agent" },
+        .{ .phrase = "● Review unavailable mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · review unavailable" },
+        .{ .phrase = "● Review evidence incomplete mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · review evidence incomplete" },
+        .{ .phrase = "● Permission required mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · permission required" },
+        .{ .phrase = "● Safety caution mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · safety caution" },
+        // With no result and more "_", the alias could be another server's
+        // tool, as my_srv's echo or Team notes' echo, so the row names none.
+        .{ .phrase = "● Running MCP mcp_my_srv_echo\n", .run = "mcp_my_srv_echo", .result = null, .outcome = null, .row = "● Using an MCP tool" },
+        .{ .phrase = "● Safety caution mcp_my_srv_echo\n", .run = "mcp_my_srv_echo", .result = null, .outcome = .denied, .row = "● Didn't use an MCP tool · safety caution" },
+        .{ .phrase = "● Denied mcp_my_srv_echo\n", .run = "mcp_my_srv_echo", .result = null, .outcome = .denied, .row = "● Didn't use an MCP tool · denied" },
+        .{ .phrase = "● Running MCP mcp_Team_notes_echo\n", .run = "mcp_Team_notes_echo", .result = null, .outcome = null, .row = "● Using an MCP tool" },
+        .{ .phrase = "● Safety caution mcp_Team_notes_echo\n", .run = "mcp_Team_notes_echo", .result = null, .outcome = .denied, .row = "● Didn't use an MCP tool · safety caution" },
+        .{ .phrase = "● Denied mcp_Team_notes_echo\n", .run = "mcp_Team_notes_echo", .result = null, .outcome = .denied, .row = "● Didn't use an MCP tool · denied" },
+        .{ .phrase = "● Failed mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .failed, .row = "● Couldn't use an MCP tool" },
+        // An alias core cut at its length limit may have lost the end of the
+        // tool's name, even when the result names the server.
+        .{ .phrase = "● Ran MCP mcp_slack_list_every_channel_message_in_the_workspace_since_last\n", .run = "mcp_slack_list_every_channel_message_in_the_workspace_since_last", .result = "{\"server\":\"slack\",\"tool\":\"mcp_slack_list_every_channel_message_in_the_workspace_since_last\",\"result\":{}}", .outcome = .completed, .row = "● Used an MCP tool" },
+    };
+    for (cases) |case| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
+        var arguments: [128]u8 = undefined;
+        const details = [_]ToolDetailRecord{.{
+            .entry_id = 1,
+            .tool_name = @constCast("toolbox"),
+            .activity_kind = .mcp,
+            .arguments_json = try std.mem.print(&arguments, "{{\"run\":\"{s}\",\"arguments\":{{}}}}", .{case.run}),
+            .result = if (case.result) |text| @constCast(text) else null,
+            .outcome = case.outcome,
+        }};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.phrase, text });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A call still running takes the server a finished call of its tool
+    // names, and a failed `fx mcp call` of a one-word server, which keeps no
+    // result, still names its server and tool. A cancelled call with no
+    // result whose alias could be another server's names none, nor does its
+    // notice.
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_team_notes_search\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running MCP mcp_team_notes_search\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Failed mcp_fixture_echo\n", .class = .tool_status } },
+        // Another program's MCP name, which fx never gives a tool, keeps it.
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed mcp__filesystem__read_text_file\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "▪ Cancelled mcp_bloop_get_account" ++ cancellation_follow_up, .class = .tool_status } },
+    };
+    const run = "{\"run\":\"mcp_team_notes_search\",\"arguments\":{}}";
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .result = @constCast("{\"server\":\"team_notes\",\"tool\":\"mcp_team_notes_search\",\"result\":{}}"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run) },
+        .{ .entry_id = 3, .tool_name = @constCast("mcp_fixture_echo"), .activity_kind = .mcp, .outcome = .failed },
+        .{ .entry_id = 4, .tool_name = @constCast("mcp__filesystem__read_text_file"), .activity_kind = .mcp, .outcome = .failed },
+        .{ .entry_id = 5, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast("{\"run\":\"mcp_bloop_get_account\",\"arguments\":{}}"), .outcome = .cancelled },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("rows:\n{s}\n", .{text});
+    try std.testing.expect(std.mem.find(u8, text, "├ Using Team_notes to search ×2\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "├ Couldn't use Fixture to echo\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "├ Couldn't run mcp__filesystem__read_text_file\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled using an MCP tool\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled using an MCP tool" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "mcp_bloop") == null);
+    try std.testing.expect(std.mem.find(u8, text, "mcp_team") == null);
+    try std.testing.expect(std.mem.find(u8, text, "get_account") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Ran MCP") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Running MCP") == null);
+}
+
+test "MCP rows name the server and tool core named for the call, in every state" {
+    const alloc = std.testing.allocator;
+    const Case = struct { phrase: []const u8, server: []const u8, tool: []const u8, outcome: ?types.ToolOutcomeKind, row: []const u8 };
+    const E = "\x1b";
+    const cases = [_]Case{
+        // A server whose name has a "_" or a space, in every state, with no
+        // result to name it.
+        .{ .phrase = "● Running MCP mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = null, .row = "● Using My_srv to echo" },
+        .{ .phrase = "● Ran MCP mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .completed, .row = "● Used My_srv to echo" },
+        .{ .phrase = "● Failed mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .failed, .row = "● Couldn't use My_srv to echo" },
+        .{ .phrase = "● Safety caution mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .denied, .row = "● Didn't use My_srv to echo · safety caution" },
+        .{ .phrase = "● Denied mcp_Team_notes_echo\n", .server = "Team notes", .tool = "echo", .outcome = .denied, .row = "● Didn't use Team notes to echo · denied" },
+        .{ .phrase = "● Review unavailable mcp_Team_notes_echo\n", .server = "Team notes", .tool = "echo", .outcome = .denied, .row = "● Didn't use Team notes to echo · review unavailable" },
+        // A unicode server's alias is all "_" where the alias spells it.
+        .{ .phrase = "● Safety caution mcp___n___echo\n", .server = "ünï", .tool = "echo", .outcome = .denied, .row = "● Didn't use ünï to echo · safety caution" },
+        .{ .phrase = "● Ran MCP mcp___n___echo\n", .server = "ünï", .tool = "echo", .outcome = .completed, .row = "● Used ünï to echo" },
+        // The tool's own name, not the alias's spelling of it.
+        .{ .phrase = "● Ran MCP mcp_fixture_caf___list\n", .server = "fixture", .tool = "café_list", .outcome = .completed, .row = "● Used Fixture to café list" },
+        // An alias cut at 64 bytes, and one with the "_2" of a name another
+        // tool had first.
+        .{ .phrase = "● Ran MCP mcp_fixture_a_very_long_tool_name_that_goes_well_beyond_the_sixt\n", .server = "fixture", .tool = "a_very_long_tool_name_that_goes_well_beyond_the_sixty_four_byte_alias_limit", .outcome = .completed, .row = "● Used Fixture to a very long tool name that goes well beyond the sixty four byte alias limit" },
+        .{ .phrase = "● Ran MCP mcp_a_b_c_2\n", .server = "a", .tool = "b_c", .outcome = .completed, .row = "● Used A to b c" },
+        // A name the terminal would act on shows escaped.
+        .{ .phrase = "● Ran MCP mcp_bad__0_PWN_srv_echo\n", .server = "bad" ++ E ++ "]0;PWN\x07srv", .tool = "echo", .outcome = .completed, .row = "● Used Bad\\x1b]0;PWN\\x07srv to echo" },
+        .{ .phrase = "● Ran MCP mcp_fixture_echo\n", .server = "fixture", .tool = "ec\x07ho", .outcome = .completed, .row = "● Used Fixture to ec\\x07ho" },
+        // The tool repeats its server's name, as the alias spells it.
+        .{ .phrase = "● Ran MCP mcp_fixture_fixture_list_items\n", .server = "fixture", .tool = "fixture_list_items", .outcome = .completed, .row = "● Used Fixture to list items" },
+        .{ .phrase = "● Ran MCP mcp_Team_notes_team_notes_search\n", .server = "Team notes", .tool = "team_notes_search", .outcome = .completed, .row = "● Used Team notes to search" },
+        .{ .phrase = "● Ran MCP mcp_fixture_fixture\n", .server = "fixture", .tool = "fixture", .outcome = .completed, .row = "● Used Fixture to fixture" },
+        .{ .phrase = "● Ran MCP mcp_1password_item2Get_v3\n", .server = "1password", .tool = "item2Get_v3", .outcome = .completed, .row = "● Used 1password to item2 get v3" },
+        .{ .phrase = "● Ran MCP mcp_fixture_getHTTPStatus\n", .server = "fixture", .tool = "getHTTPStatus", .outcome = .completed, .row = "● Used Fixture to get http status" },
+    };
+    for (cases) |case| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
+        const alias = std.mem.trimEnd(u8, case.phrase[std.mem.findScalar(u8, case.phrase, 'm').?..], "\n");
+        var arguments: [160]u8 = undefined;
+        const details = [_]ToolDetailRecord{.{
+            .entry_id = 1,
+            .tool_name = @constCast("toolbox"),
+            .activity_kind = .mcp,
+            .arguments_json = try std.mem.print(&arguments, "{{\"run\":\"{s}\",\"arguments\":{{}}}}", .{alias}),
+            .outcome = case.outcome,
+            .mcp_server = @constCast(case.server),
+            .mcp_tool = @constCast(case.tool),
+        }};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.phrase, text });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A row learns the names from whichever of its calls core named, and a
+    // cancelled call's notice names the call as its row does.
+    const run = "{\"run\":\"mcp_my_srv_echo\",\"arguments\":{}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_my_srv_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running MCP mcp_my_srv_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "▪ Cancelled mcp_Team_notes_echo" ++ cancellation_follow_up, .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .mcp_server = @constCast("my_srv"), .mcp_tool = @constCast("echo") },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast("{\"run\":\"mcp_Team_notes_echo\",\"arguments\":{}}"), .outcome = .cancelled, .mcp_server = @constCast("Team notes"), .mcp_tool = @constCast("echo") },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("rows:\n{s}\n", .{text});
+    try std.testing.expect(std.mem.find(u8, text, "├ Using My_srv to echo ×2\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled using Team notes to echo\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled using Team notes to echo" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "an MCP tool") == null);
 }
 
 /// A running subagent call's identity by the agent its status names, such
@@ -2802,9 +4135,11 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             // own row, so what happened to it shows. One still running joins
             // the file's row, where it stays when it completes.
             if (record.outcome) |outcome| if (outcome != .completed) return .{};
-            if (!entryShowsDiffStats(detail)) return .{};
-            const path = storyArgString(scratch, record, "path") orelse return .{};
-            return .{ .kind = .edit, .key = path };
+            const change = try fileChangeOf(scratch, detail) orelse return .{};
+            // A completed change with no path of its own takes the file its
+            // status names (`statusFileIdentity`).
+            const path = jsonArgString(scratch, change.arguments, "path") orelse return .{};
+            return try fileChangeIdentity(scratch, record, path);
         },
         .mcp => {
             // A call that failed, was denied, or was cancelled keeps its own
@@ -2937,7 +4272,7 @@ fn collectStoryRows(
             try unshown.put(scratch, entry_id, {});
             continue :calls;
         };
-        const identity = try moreOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail))));
+        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try storyIdentity(scratch, detail)))));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -2960,6 +4295,9 @@ fn collectStoryRows(
         };
         const target = for (candidates) |*row| {
             if (sharesStoryRow(row.identity, identity)) break row;
+            // A change still running has only the path it named, so it
+            // joins the row of a call that named the file the same way.
+            if (identity.kind == .edit and row.identity.kind == .edit and namedFileBefore(row, identity.alias)) break row;
             if (identity.kind == .session and std.mem.eql(u8, row.session, identity.key)) break row;
         } else new: {
             // A run's record keeps its output but not the session it started,
@@ -2984,6 +4322,7 @@ fn collectStoryRows(
                         try last.combined.append(scratch, last.detail.?);
                     }
                     try last.combined.append(scratch, detail.?);
+                    last.count += 1;
                     last.entry = entry;
                     last.entry_id = entry_id;
                     last.detail = detail;
@@ -3005,13 +4344,27 @@ fn collectStoryRows(
         target.status_index = status_index;
         if (try commandStillRunning(scratch, entry)) target.background = detail;
         target.tries = retries.tries.get(entry_id) orelse 0;
+        if (target.mcp_server.len == 0) if (detail) |record| if (try mcpResultServer(scratch, record)) |server| {
+            target.mcp_server = server;
+        };
+        if (target.mcp_tool == null) if (detail) |record| if (record.mcp_server) |server| if (record.mcp_tool) |tool| {
+            target.mcp_tool = .{ .server = server, .tool = tool };
+        };
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addLatest(&target.names, scratch, name);
+        if (completedResolvedPath(detail)) |path| switch (identity.kind) {
+            .read => if (std.mem.eql(u8, detail.?.tool_name, "read_file")) try setReadLink(&target.read_links, scratch, identity.key, path),
+            .edit => target.resolved_path = path,
+            else => {},
+        };
         if (identity.kind == .edit) {
             const totals = diffTotalsOfPhrase(try entryStatus(scratch, entry) orelse "");
             target.diff.added +|= totals.added;
             target.diff.removed +|= totals.removed;
-            if (std.mem.eql(u8, detail.?.tool_name, "write_file")) target.writes += 1;
+            if (try fileChangeOf(scratch, detail)) |change| if (std.mem.eql(u8, change.tool, "write_file")) {
+                target.writes += 1;
+            };
+            try StoryTally.addDistinct(&target.named_paths, scratch, identity.alias);
         }
     }
     for (rows.items) |*row| {
@@ -3038,7 +4391,7 @@ fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) 
         if (try repeatKey(scratch, &row)) |key| {
             const first = try firsts.getOrPut(scratch, key);
             if (first.found_existing) {
-                rows.items[first.value_ptr.*].joined_calls += rowCalls(&row);
+                rows.items[first.value_ptr.*].joined_calls += row.count;
                 continue;
             }
             first.value_ptr.* = kept;
@@ -3072,9 +4425,10 @@ fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     return if (phraseShowsProgress(body)) null else body;
 }
 
-/// How many calls a row stands for.
+/// How many calls a row stands for, with those of the later rows
+/// joinRepeatedRows folded into it.
 fn rowCalls(row: *const StoryRow) usize {
-    return if (row.identity.kind == .commands) row.combined.items.len else row.count;
+    return row.count + row.joined_calls;
 }
 
 /// How many calls a row that later repeats joined stands for, such as
@@ -3083,7 +4437,7 @@ fn rowCalls(row: *const StoryRow) usize {
 fn joinedNote(scratch: std.mem.Allocator, row: *const StoryRow) ![]const u8 {
     if (row.joined_calls == 0) return "";
     const messages = isSubagentMessage(scratch, row.detail.?);
-    return countNote(scratch, " · ", rowCalls(row) + row.joined_calls, if (messages) " messages" else " calls");
+    return countNote(scratch, " · ", rowCalls(row), if (messages) " messages" else " calls");
 }
 
 /// Whether a call is main's message to a subagent, not a report, wait, or
@@ -3177,7 +4531,8 @@ fn sessionRunRow(rows: []StoryRow, follow_up: *const ToolDetailRecord) ?*StoryRo
 }
 
 /// Whether a call with `identity` joins the row of an earlier call with
-/// `row`. Every read shares one row, and every search with the same tool.
+/// `row`. Every read shares one row, every search with the same tool, and
+/// every search of the same saved output.
 /// A bare subagent wait or status says what main did while its subagents
 /// worked, so it keeps a row of its own; later calls with the same action
 /// join it with their latest state, and a status and a wait stay apart, so
@@ -3187,6 +4542,7 @@ fn sharesStoryRow(row: StoryIdentity, identity: StoryIdentity) bool {
     return switch (identity.kind) {
         .read, .more_output => true,
         .search => std.mem.eql(u8, storySearchTool(row.key), storySearchTool(identity.key)),
+        .output_search => std.mem.eql(u8, outputSearchSource(row.key), outputSearchSource(identity.key)),
         else => std.mem.eql(u8, row.key, identity.key),
     };
 }
@@ -3212,7 +4568,9 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         const label = try checkRowPhrase(scratch, row, own_label) orelse own_label;
         var steps = try combinedCommandSteps(scratch, row.combined.items);
         var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
-        const note = try joinedNote(scratch, row);
+        // The row names each step once, so only its count says how many
+        // calls it holds, which are two or more.
+        const note = try countNote(scratch, " · ", rowCalls(row), " calls");
         // A narrow row leaves out its oldest steps first, so the newest stays
         // in view. The budget leaves room for the connector and the mark.
         const budget: usize = if (cols > 4) cols - 4 else 1;
@@ -3238,19 +4596,23 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         const reason = if (row.ends_turn) try neverRanReason(scratch, record) orelse "" else "";
         return .{ .display = phrase, .body = phrase, .suffix = "", .reason = reason };
     };
+    if (row.detail) |record| if (try heldCommandRowText(scratch, status_phrase, record, row.launch_command, style)) |held| return held;
+    if (try unrunMcpRowText(scratch, status_phrase, row)) |unrun| return unrun;
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const reprojected_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
     const full_phrase = try checkRowPhrase(scratch, row, reprojected_phrase) orelse reprojected_phrase;
     const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record, row.starts) else null;
-    const named_phrase = if (try moreOutputRowPhrase(scratch, full_phrase, row)) |more|
-        more
+    const named_phrase = if (try savedReadRowPhrase(scratch, row)) |saved|
+        saved
     else if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
         read
     else if (try editRowPhrase(scratch, full_phrase, row)) |edit|
         edit
     else if (agent_phrase) |agent|
         agent
+    else if (try mcpRowPhrase(scratch, full_phrase, row)) |mcp|
+        mcp
     else if (try shortenCommandPhrase(scratch, full_phrase, row.detail, row.launch_command, style.text_style)) |short|
         short
     else
@@ -3300,6 +4662,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .mcp => try countNote(scratch, " ×", row.count, ""),
         .read, .more_output => try countNote(scratch, " · ", row.count, " parts"),
         .search => if (many_folders) "" else try countNote(scratch, " ×", row.count, ""),
+        .output_search => try countNote(scratch, " ×", row.count, ""),
         .edit => try countNote(scratch, " · ", row.count, if (row.writes == 0) " edits" else if (row.writes == row.count) " writes" else " changes"),
         .single, .subagent, .subagent_wait, .commands => "",
     };
@@ -3309,6 +4672,117 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .suffix = suffix,
         .reason = reason,
     };
+}
+
+test "a row of several commands counts its calls wherever it shows" {
+    const alloc = std.testing.allocator;
+    // Twelve calls of ten steps: the row names each step once, where it last
+    // ran, so only its count says how many calls it holds. A read comes
+    // first, so the row can show under a header too.
+    const commands = [_][]const u8{ "git status", "git diff", "ls", "cat notes.md", "rg retry", "sed -n 1p notes.md", "wc -l notes.md", "git status", "git diff", "git rev-parse HEAD", "head -5 notes.md", "git log -1" };
+    var entries: [commands.len + 1]TranscriptEntry = undefined;
+    var details: [commands.len + 1]ToolDetailRecord = undefined;
+    var json_bufs: [commands.len][64]u8 = undefined;
+    var status_bufs: [commands.len][64]u8 = undefined;
+    entries[0] = .{ .raw_bytes = .{ .id = 1, .bytes = "● Read notes.md\n", .class = .tool_status } };
+    details[0] = storyReadDetailForTest(1, "notes.md");
+    for (commands, json_bufs[0..], status_bufs[0..], 1..) |command, *json_buf, *status_buf, index| {
+        const id: u32 = @intCast(index + 1);
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = try std.mem.print(status_buf, "● Ran {s}\n", .{command}), .class = .tool_status } };
+        details[index] = storyCommandDetail(id, try std.mem.print(json_buf, "{{\"command\":\"{s}\"}}", .{command}), 0, null);
+        details[index].command_display = @constCast(command);
+    }
+    const ran = "Ran +7, git rev-parse, head, git log · 12 calls";
+    try expectLiveAndResumedRowsForTest(alloc, entries[1..], details[1..], "● " ++ ran ++ " ✓");
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("under a header:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, text, "\n"), "\n└ " ++ ran));
+    }
+    {
+        var running_entries = entries;
+        var running = details;
+        running_entries[commands.len].raw_bytes.bytes = "● Running git log -1\n";
+        running[commands.len].outcome = null;
+        running[commands.len].command_process_presentation = null;
+        try expectLiveAndResumedRowsForTest(alloc, running_entries[1..], running[1..], "● Running +7, git rev-parse, head, git log · 12 calls");
+    }
+    // A narrow row counts more of its older steps in front, and keeps its
+    // newest step and its count in view.
+    const Narrow = struct { cols: u16, want: []const u8 };
+    for ([_]Narrow{
+        .{ .cols = 40, .want = "● Ran +8, head, git log · 12 calls ✓" },
+        .{ .cols = 30, .want = "● Ran +9, git log · 12 calls ✓" },
+    }) |narrow| {
+        const painted = try paintedGroupForTest(alloc, entries[1..], details[1..], narrow.cols);
+        defer alloc.free(painted);
+        const text = try visibleLinesForTest(alloc, painted, narrow.cols);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(narrow.want, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A row of one call gets no count, whatever its command runs.
+    {
+        const command = "git status && git diff && echo a && ls && pwd";
+        const one = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command ++ "\n", .class = .tool_status } }};
+        var one_details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"command\":\"" ++ command ++ "\"}", 0, null)};
+        one_details[0].command_display = @constCast(command);
+        try expectLiveAndResumedRowsForTest(alloc, &one, &one_details, "● Ran git status, git diff, echo +2 more ✓");
+    }
+
+    // Later calls to a session the row started count too, though the row
+    // names their command once.
+    {
+        var first = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"printf a\"}", 0, null);
+        first.command_display = @constCast("printf a");
+        var run = storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"sh loop.sh\"}", 0, "1 108\n");
+        run.command_process_presentation = null;
+        run.command_display = @constCast("sh loop.sh");
+        var observe = storyCommandDetail(3, "{\"action\":\"interact\",\"session_id\":\"shell-9\"}", 0, null);
+        observe.command_process_presentation = null;
+        observe.command_display = @constCast("sh loop.sh");
+        var stop = storyCommandDetail(4, "{\"action\":\"stop\",\"session_id\":\"shell-9\"}", 0, null);
+        stop.command_display = @constCast("sh loop.sh");
+        const session_entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf a\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running sh loop.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Observed sh loop.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Stopped sh loop.sh\n", .class = .tool_status } },
+        };
+        const session_details = [_]ToolDetailRecord{ first, run, observe, stop };
+        const wants = [_][]const u8{ "● Still running printf, sh loop.sh · 2 calls", "● Waiting for printf, sh loop.sh · 3 calls", "● Stopped printf, sh loop.sh · 4 calls ✓" };
+        for (wants, 2..) |want, count| try expectLiveAndResumedRowsForTest(alloc, session_entries[0..count], session_details[0..count], want);
+    }
+
+    // A row of commands said again later in its group keeps one count, of
+    // every call of both.
+    {
+        const steps = [_][]const u8{ "sed -n 1p a.ts", "grep -c x a.ts", "sed -n 2p b.ts", "grep -c y b.ts" };
+        const said_again = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sed -n 1p a.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran grep -c x a.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Read b.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran sed -n 2p b.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 5, .bytes = "● Ran grep -c y b.ts\n", .class = .tool_status } },
+        };
+        var said_details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"command\":\"sed -n 1p a.ts\"}", 0, null),
+            storyCommandDetail(2, "{\"command\":\"grep -c x a.ts\"}", 0, null),
+            storyReadDetailForTest(3, "b.ts"),
+            storyCommandDetail(4, "{\"command\":\"sed -n 2p b.ts\"}", 0, null),
+            storyCommandDetail(5, "{\"command\":\"grep -c y b.ts\"}", 0, null),
+        };
+        for ([_]usize{ 0, 1, 3, 4 }, steps) |index, command| said_details[index].command_display = @constCast(command);
+        const text = try groupTextForTest(alloc, &said_again, &said_details);
+        defer alloc.free(text);
+        errdefer std.debug.print("said again:\n{s}\n", .{text});
+        var rows = std.mem.splitScalar(u8, std.mem.trim(u8, text, "\n"), '\n');
+        _ = rows.next();
+        try std.testing.expectEqualStrings("├ Ran sed, grep · 4 calls", rows.next().?);
+        try std.testing.expectEqualStrings("└ Read b.ts", rows.next().?);
+        try std.testing.expect(rows.next() == null);
+    }
 }
 
 /// `before`, `count`, then `after`, such as " ×3" or " +2 more", in
@@ -3710,7 +5184,10 @@ fn recapTurnSummary(
     return try alloc.dupe(u8, recapped);
 }
 
-const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
+const GroupBlock = struct {
+    bytes: []u8,
+    lines: []const transcript_blocks.LineProvenance,
+};
 
 fn formatGroupBlock(
     alloc: std.mem.Allocator,
@@ -3720,7 +5197,8 @@ fn formatGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
-    wait_messages: usize,
+    wait_messages: []const usize,
+    counted_messages: []bool,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -3735,7 +5213,7 @@ fn formatGroupBlock(
     errdefer out.deinit();
     // writeGroupBlock has no cleanup of its own, so its many failure points
     // share this one; each `try` here would repeat the cleanup in the binary.
-    const header = try writeGroupBlock(alloc, scratch_state.allocator(), &out.writer, &lines, entries, status_indices, details, detail_indices, output_sources, summary, wait_messages, focused_entry_id, collapse_tool_calls, cols, style, styles);
+    const header = try writeGroupBlock(alloc, scratch_state.allocator(), &out.writer, &lines, entries, status_indices, details, detail_indices, output_sources, summary, wait_messages, counted_messages, focused_entry_id, collapse_tool_calls, cols, style, styles);
     const bytes = if (collapse_tool_calls) try alloc.dupe(u8, header) else try out.toOwnedSlice();
     errdefer alloc.free(bytes);
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
@@ -3743,8 +5221,9 @@ fn formatGroupBlock(
 
 /// Writes a group's header and, unless `collapse_tool_calls`, its rows to
 /// `out`, and their provenance to `lines`. `wait_messages` are the messages
-/// that joined the row of the group's last call, a wait (`joinWaitChain`).
-/// Returns the header, which lives in `scratch`.
+/// the group's waits took (`joinWaitChain`); `counted_messages` says which of
+/// them a row counts (`countWaitMessages`). Returns the header, which lives
+/// in `scratch`.
 fn writeGroupBlock(
     alloc: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -3756,7 +5235,8 @@ fn writeGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
-    wait_messages: usize,
+    wait_messages: []const usize,
+    counted_messages: []bool,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -3783,9 +5263,7 @@ fn writeGroupBlock(
         try tally.observe(scratch, entry, detail);
     }
     try tally.subagent_rows.note(scratch, rows.items);
-    if (wait_messages > 0) if (lastStatusRow(entries, status_indices, rows.items)) |row| {
-        row.received_messages = wait_messages;
-    };
+    try countWaitMessages(scratch, entries, rows.items, wait_messages, counted_messages);
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
@@ -3855,11 +5333,15 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
         if (detail.outcome != .cancelled) continue;
 
-        // A cancelled command's notice names no command; its row does.
+        // A cancelled command's notice names no command, and a stopped
+        // wait's names no subagent; its row does. A call whose row names it
+        // in the compact row's words, such as a read of saved output or an
+        // MCP call, has a notice that names it so too.
         var shown = entry;
-        if (isShellCommandCall(scratch, detail)) {
-            if (try cancelledCommandNotice(scratch, entry.raw_bytes.bytes)) |notice| shown.raw_bytes.bytes = notice;
-        }
+        const name = if (isShellCommandCall(scratch, detail) or isWaitAction(scratch, detail)) "" else try cancelledCallName(scratch, rows.items, entry_id);
+        if (name) |shown_name| if (try cancelledNotice(scratch, entry.raw_bytes.bytes, shown_name)) |notice| {
+            shown.raw_bytes.bytes = notice;
+        };
         const terminal = try transcript_blocks.renderEntryToBlock(scratch, shown, cols, styles);
         if (terminal.bytes.len > 0) {
             try lines.append(alloc, .block_separator);
@@ -3871,6 +5353,19 @@ fn writeGroupBlock(
         terminal.deinit(scratch);
     }
     return header;
+}
+
+/// What the row of the cancelled call `entry_id` names it by in the compact
+/// row's words, such as "github.com output for "npx"" or "using Fixture to echo".
+/// Null for a call whose row keeps core's name.
+fn cancelledCallName(scratch: std.mem.Allocator, rows: []const StoryRow, entry_id: u32) !?[]const u8 {
+    const row = for (rows) |*candidate| {
+        if (candidate.entry_id == entry_id) break candidate;
+    } else return null;
+    const phrase = try savedReadRowPhrase(scratch, row) orelse
+        try mcpRowPhrase(scratch, try entryStatus(scratch, row.entry) orelse return null, row) orelse
+        return null;
+    return withoutPrefix(phrase, cancelled_label ++ " ");
 }
 
 /// A row clipped to `cols` behind `lead`, such as "● " or "├ ", with `mark`
@@ -3900,7 +5395,7 @@ const story_reason_min_cols = 8;
 /// `mark` after them, as clipStoryRow writes a row with no reason.
 fn clipStoryPhrase(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryRow, text: *const StoryRowText, mark: []const u8, cols: u16, style: SummaryStyle) ![]const u8 {
     const tail = try std.mem.concat(scratch, u8, &.{ text.suffix, mark });
-    if (!entryShowsDiffStats(row.detail))
+    if (!try entryShowsDiffStats(scratch, row.detail))
         return clipKeepingTail(scratch, try std.mem.concat(scratch, u8, &.{ lead, text.body }), tail, cols, style.text_style);
     const tail_width = display_width.visibleWidthIgnoringAnsi(tail);
     const phrase_cols: u16 = if (cols > tail_width * 2) @intCast(cols - tail_width) else cols;
@@ -5049,11 +6544,66 @@ const known_multiword_labels = [_][]const u8{
     "Denied by auto agent",
     "Review evidence incomplete",
     "Permission required",
-    "Safety caution",
+    safety_caution_label,
     "Review unavailable",
     "Timed out",
     still_running_label,
 };
+
+/// Core's label for a command the safety review held
+/// (`permissionDeniedStatusLabel` in src/core/agent/runtime/tool_admission.zig).
+const safety_caution_label = "Safety caution";
+/// Why a held command's row says it was held.
+const safety_caution_note = " · safety caution";
+
+/// A command the safety review held, as "Held python3 · safety caution":
+/// what happened to the command, then why, so core's label does not read
+/// as part of the command. Null for any other row.
+fn heldCommandRowText(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord, launch_command: ?[]const u8, style: SummaryStyle) !?StoryRowText {
+    if (record.outcome != .denied or !isShellCommandCall(scratch, record)) return null;
+    const label = safety_caution_label ++ " ";
+    if (!std.mem.startsWith(u8, phrase, label)) return null;
+    // Core cuts a long command short in its row; the short form needs it whole.
+    const full_phrase = try reprojectTruncatedCommandPhrase(scratch, phrase, record) orelse phrase;
+    const shown = try shortenCommandPhrase(scratch, full_phrase, record, launch_command, style.text_style) orelse
+        try highlightCommandPhrase(scratch, full_phrase, record, style.text_style) orelse full_phrase;
+    if (!std.mem.startsWith(u8, shown, label)) return null;
+    return try heldRowText(scratch, shown[label.len..]);
+}
+
+/// "Held <name> · safety caution": what happened to the call, then why.
+fn heldRowText(scratch: std.mem.Allocator, name: []const u8) !StoryRowText {
+    const body = try std.mem.concat(scratch, u8, &.{ "Held ", name });
+    return .{ .display = try std.mem.concat(scratch, u8, &.{ body, safety_caution_note }), .body = body, .suffix = safety_caution_note };
+}
+
+test "a command the safety review held says it was held, then why" {
+    const alloc = std.testing.allocator;
+    // Long enough that its row shows its program alone.
+    const held_command = "python3 -c 'import json, os, sys; print(json.dumps(sorted(os.listdir(sys.argv[1]))))' .";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Safety caution " ++ held_command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran echo done\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("shell"), .activity_kind = .command, .arguments_json = @constCast("{\"command\":\"" ++ held_command ++ "\"}"), .command_display = @constCast(held_command), .outcome = .denied },
+        storyCommandDetail(2, "{\"command\":\"echo done\"}", 0, null),
+    };
+    details[1].command_display = @constCast("echo done");
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("held:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings("● Ran a command ✓ · 1 denied", firstLineForTest(text));
+    try std.testing.expect(std.mem.find(u8, text, "├ Held python3 · safety caution\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Safety caution") == null);
+
+    // Core cut the long command short in its row.
+    const cut = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Safety caution python3 -c 'import json, os, sys; print(json.dumps(sor...\n", .class = .tool_status } }};
+    const cut_text = try groupTextForTest(alloc, &cut, details[0..1]);
+    defer alloc.free(cut_text);
+    errdefer std.debug.print("cut:\n{s}\n", .{cut_text});
+    try std.testing.expectEqualStrings("● Held python3 · safety caution", std.mem.trim(u8, cut_text, "\n"));
+}
 
 fn knownLabelPrefix(phrase: []const u8) ?usize {
     for (known_multiword_labels) |label| {
@@ -5140,7 +6690,7 @@ fn formatExpandedChild(
     else
         "";
     const child = try std.mem.concat(scratch, u8, &.{ marker, marker_reset, " ", display_phrase });
-    const accented = if (entryShowsDiffStats(detail))
+    const accented = if (try entryShowsDiffStats(scratch, detail))
         try accentTrailingDiffStats(scratch, child, "")
     else
         child;
@@ -5486,12 +7036,48 @@ fn buildWithStyleAndStats(
     return projection;
 }
 
-/// The row that shows the call of the group's last status entry.
-fn lastStatusRow(entries: []const TranscriptEntry, status_indices: []const usize, rows: []StoryRow) ?*StoryRow {
-    if (status_indices.len == 0) return null;
-    const entry_id = toolStatusEntryId(entries[status_indices[status_indices.len - 1]]) orelse return null;
-    for (rows) |*row| if (row.entry_id == entry_id) return row;
-    return null;
+/// Counts each of `messages`, the messages a group's waits took, on the row
+/// that waits for its sender (`waitRowFor`), and marks it in `counted`, so
+/// its own line goes. A message no row waits for keeps its own line.
+fn countWaitMessages(scratch: std.mem.Allocator, entries: []const TranscriptEntry, rows: []StoryRow, messages: []const usize, counted: []bool) !void {
+    for (messages, counted) |index, *is_counted| {
+        const sender = try messageSender(scratch, entries[index]) orelse continue;
+        const row = try waitRowFor(scratch, rows, sender) orelse continue;
+        row.received_messages += 1;
+        is_counted.* = true;
+    }
+}
+
+/// The row that counts a message from `sender` that a group's waits took:
+/// the last row that reads as a wait for `sender` (`rowWaitsFor`). Null when
+/// none does: on a row that reads "Messaged lander" or "Waited for scout", a
+/// count would read as main's own messages or as scout's.
+fn waitRowFor(scratch: std.mem.Allocator, rows: []StoryRow, sender: []const u8) !?*StoryRow {
+    var found: ?*StoryRow = null;
+    for (rows) |*row| {
+        if (!try rowWaitsFor(scratch, row, sender)) continue;
+        if (found == null or row.status_index > found.?.status_index) found = row;
+    }
+    return found;
+}
+
+/// Whether `row` reads as a wait for `sender`: its latest call is a wait,
+/// done or stopped, that names `sender`, or a bare wait whose row lists
+/// `sender` or lists no subagent.
+fn rowWaitsFor(scratch: std.mem.Allocator, row: *const StoryRow, sender: []const u8) !bool {
+    const record = row.detail orelse return false;
+    if (!isWaitCall(scratch, record) and !(record.outcome == .cancelled and isWaitAction(scratch, record))) return false;
+    if (row.identity.kind == .subagent) return std.mem.eql(u8, row.identity.key, sender);
+    const roster = waitRoster(try entryStatus(scratch, row.entry) orelse "") orelse return true;
+    return listsName(roster, sender);
+}
+
+/// Whether a call is main's `subagent` wait, however it ended.
+fn isWaitAction(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    if (!std.mem.eql(u8, record.tool_name, "subagent") or record.subagent_report) return false;
+    const action = storyArgString(scratch, record, "action") orelse return false;
+    return std.mem.eql(u8, action, "wait");
 }
 
 /// Whether a call is main's `subagent` wait that has not failed.
@@ -5507,21 +7093,31 @@ fn isWaitCall(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool
 /// Whether a report's row is a message from a subagent `roster` lists, or
 /// from any subagent when the wait listed none.
 fn isMessageFrom(scratch: std.mem.Allocator, entry: TranscriptEntry, roster: ?[]const u8) !bool {
-    const phrase = try entryStatus(scratch, entry) orelse return false;
+    const sender = try messageSender(scratch, entry) orelse return false;
+    const names = roster orelse return true;
+    return listsName(names, sender);
+}
+
+/// The subagent a message's row is from, such as "lander", or null when
+/// the row is no message from a subagent.
+fn messageSender(scratch: std.mem.Allocator, entry: TranscriptEntry) !?[]const u8 {
+    const phrase = try entryStatus(scratch, entry) orelse return null;
     const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
     const message_lead = report_rewordings[0].match;
-    if (!std.mem.startsWith(u8, lead, message_lead)) return false;
-    const sender = lead[message_lead.len..];
-    const names = roster orelse return true;
-    var listed = std.mem.splitSequence(u8, names, ", ");
-    while (listed.next()) |name| if (std.mem.eql(u8, name, sender)) return true;
+    if (!std.mem.startsWith(u8, lead, message_lead)) return null;
+    return lead[message_lead.len..];
+}
+
+/// Whether `roster`, such as "lander, scout", lists `name`.
+fn listsName(roster: []const u8, name: []const u8) bool {
+    var listed = std.mem.splitSequence(u8, roster, ", ");
+    while (listed.next()) |listed_name| if (std.mem.eql(u8, listed_name, name)) return true;
     return false;
 }
 
 /// Whether the call at `index` would be the only call of its group, as
 /// fillProjection groups them: its presentation group holds nothing else,
-/// or, with none, the run it starts ends at the next status entry, which is
-/// a report's, a question, or another presentation group's.
+/// or, with none, the run it starts ends before the next call (`runRow`).
 fn callIsAloneInGroup(
     entries: []const TranscriptEntry,
     details: []const ToolDetailRecord,
@@ -5537,8 +7133,11 @@ fn callIsAloneInGroup(
         if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         if (presentation_group_indices[next] != null) return true;
         if (toolStatusEntryId(entry)) |entry_id| {
-            const detail = detailForEntry(details, detail_indices, entry_id, null);
-            return statusNamesAsk(entry, detail) or isSubagentUpdateRow(detail);
+            switch (runRow(entry, detailForEntry(details, detail_indices, entry_id, null), false)) {
+                .joins => return false,
+                .stays_out => continue,
+                .ends => return true,
+            }
         }
         if (isAttachedEntry(entry)) continue;
         if (!isTransparentCompactEntry(entry)) return true;
@@ -5546,17 +7145,18 @@ fn callIsAloneInGroup(
     return true;
 }
 
-/// Lets a group whose last call is a wait take in the messages its
-/// subagents sent main while main waited, and the waits that took them, so
-/// "Waited for lander", "Message from lander", "Waited for lander" show as
-/// one row, "Waited for lander · 1 message". After the group's first wait
-/// that shares the last one's row, it takes each message from a subagent
-/// the wait before it lists. After the group, it takes such messages and
-/// each wait that would be alone in its group and share that row, and stops
-/// at anything else, such as a report like "lander finished", which keeps a
-/// line of its own, or text. Ctrl+O still shows every message. The entries
-/// it takes are hidden, and the waits join `status_indices` and `summary`.
-/// Returns how many messages it took.
+/// Lets a group's waits take in the messages their subagents sent main
+/// while main waited, so "Waited for lander", "Message from lander",
+/// "Waited for lander" show as one row, "Waited for lander · 1 message".
+/// After the group's first wait, it takes each message from a subagent the
+/// wait before it lists, whatever row that wait shares, into `messages`,
+/// which the row that waits for its sender counts (`countWaitMessages`).
+/// When the group ends on a wait, it goes on after the group: it takes such
+/// messages and each wait that would be alone in its group and share that
+/// row, and stops at anything else, such as a report like "lander
+/// finished", which keeps a line of its own, or text. Ctrl+O still shows
+/// every message. The waits it takes are hidden and join `status_indices`
+/// and `summary`.
 fn joinWaitChain(
     alloc: std.mem.Allocator,
     projection: *Projection,
@@ -5567,28 +7167,28 @@ fn joinWaitChain(
     presentation_groups: []const PresentationGroup,
     status_indices: *std.ArrayList(usize),
     summary: *Summary,
-) !usize {
+    messages: *std.ArrayList(usize),
+) !void {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     // The waits it takes go after these, so the group's own calls stay here.
     const member_count = status_indices.items.len;
-    if (member_count == 0) return 0;
+    if (member_count == 0) return;
+    const first_wait = for (status_indices.items) |member| {
+        if (isWaitCall(scratch, statusDetail(entries, details, detail_indices, member))) break member;
+    } else return;
     const last_index = status_indices.items[member_count - 1];
     const last_detail = statusDetail(entries, details, detail_indices, last_index);
-    if (!isWaitCall(scratch, last_detail)) return 0;
-    const wait_identity = try storyIdentity(scratch, last_detail);
-    const first_wait = for (status_indices.items) |member| {
-        const detail = statusDetail(entries, details, detail_indices, member);
-        if (isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail))) break member;
-    } else last_index;
+    const ends_on_wait = isWaitCall(scratch, last_detail);
+    const wait_identity: StoryIdentity = if (ends_on_wait) try storyIdentity(scratch, last_detail) else .{};
     var roster = waitRoster(try entryStatus(scratch, entries[first_wait]) orelse "");
-    var messages: usize = 0;
     var index = first_wait + 1;
     while (index < entries.len) : (index += 1) {
         const entry = entries[index];
         if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const in_group = index <= last_index;
+        if (!in_group and !ends_on_wait) break;
         const entry_id = toolStatusEntryId(entry) orelse {
             if (in_group or isAttachedEntry(entry) or isTransparentCompactEntry(entry)) continue;
             break;
@@ -5596,18 +7196,19 @@ fn joinWaitChain(
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         if (isSubagentUpdateRow(detail)) {
             if (try isMessageFrom(scratch, entry, roster)) {
-                projection.entry_actions.items[index] = .hide;
-                messages += 1;
+                try messages.append(alloc, index);
                 continue;
             }
             if (in_group) continue;
             break;
         }
-        const takes_row = isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail));
         if (in_group) {
-            if (takes_row and std.mem.findScalar(usize, status_indices.items[0..member_count], index) != null) roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+            if (isWaitCall(scratch, detail) and std.mem.findScalar(usize, status_indices.items[0..member_count], index) != null) {
+                roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+            }
             continue;
         }
+        const takes_row = isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail));
         if (!takes_row or projection.entry_actions.items[index] != .keep) break;
         if (!callIsAloneInGroup(entries, details, detail_indices, presentation_group_indices, presentation_groups, index)) break;
         projection.entry_actions.items[index] = .hide;
@@ -5616,7 +7217,14 @@ fn joinWaitChain(
         observeTool(summary, detail);
         roster = waitRoster(try entryStatus(scratch, entry) orelse "");
     }
-    return messages;
+}
+
+/// Hides the lines of the messages a group's waits took that a row counts.
+/// Ctrl+O still shows each one.
+fn hideCountedMessages(projection: *Projection, messages: []const usize, counted: []const bool) void {
+    for (messages, counted) |index, is_counted| if (is_counted) {
+        projection.entry_actions.items[index] = .hide;
+    };
 }
 
 /// The detail of the call whose status entry is at `index`.
@@ -5799,7 +7407,12 @@ fn fillProjection(
             defer group_indices.deinit(alloc);
             try group_indices.appendSlice(alloc, group.status_indices.items);
             var group_summary = group.summary;
-            const wait_messages = try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &group_indices, &group_summary);
+            var wait_messages: std.ArrayList(usize) = .empty;
+            defer wait_messages.deinit(alloc);
+            try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &group_indices, &group_summary, &wait_messages);
+            const counted_messages = try alloc.alloc(bool, wait_messages.items.len);
+            defer alloc.free(counted_messages);
+            @memset(counted_messages, false);
 
             const bytes = try formatGroupBlock(
                 alloc,
@@ -5809,13 +7422,15 @@ fn fillProjection(
                 detail_indices,
                 &output_sources,
                 group_summary,
-                wait_messages,
+                wait_messages.items,
+                counted_messages,
                 focused_entry_id,
                 collapse_tool_calls,
                 cols,
                 style,
                 styles,
             );
+            hideCountedMessages(projection, wait_messages.items, counted_messages);
             if (bytes.bytes.len == 0) {
                 // Its calls name nothing yet, so the group shows nothing.
                 alloc.free(bytes.bytes);
@@ -5827,6 +7442,7 @@ fn fillProjection(
 
         const detail = detailForEntry(details, detail_indices, entry_id, stats);
         if (statusNamesAsk(entries[index], detail)) {
+            if (try stoppedQuestionRow(alloc, detail, entry_id, cols, style)) |row| try projection.setOwnedGroup(alloc, index, row);
             index += 1;
             continue;
         }
@@ -5836,6 +7452,8 @@ fn fillProjection(
         var status_indices: std.ArrayList(usize) = .empty;
         defer status_indices.deinit(alloc);
         var summary: Summary = .{};
+        // The first row the run passed over, which the loop draws next.
+        var first_left_out: ?usize = null;
 
         while (index < entries.len) : (index += 1) {
             try build_checkpoint.tick(checkpoint);
@@ -5843,8 +7461,16 @@ fn fillProjection(
             if (presentation_group_indices[index] != null) break;
             if (toolStatusEntryId(entries[index])) |group_entry_id| {
                 const group_detail = detailForEntry(details, detail_indices, group_entry_id, stats);
-                if (statusNamesAsk(entries[index], group_detail)) break;
-                if (isSubagentUpdateRow(group_detail) != updates_run) break;
+                // A message a wait's row took shows there (`joinWaitChain`).
+                if (isSubagentUpdateRow(group_detail) and projection.entry_actions.items[index] == .hide) continue;
+                switch (runRow(entries[index], group_detail, updates_run)) {
+                    .joins => {},
+                    .stays_out => {
+                        if (first_left_out == null) first_left_out = index;
+                        continue;
+                    },
+                    .ends => break,
+                }
                 observeTool(&summary, group_detail);
                 try status_indices.append(alloc, index);
                 projection.entry_actions.items[index] = .hide;
@@ -5856,7 +7482,12 @@ fn fillProjection(
             }
             if (!isTransparentCompactEntry(entries[index])) break;
         }
-        const wait_messages = try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &status_indices, &summary);
+        var wait_messages: std.ArrayList(usize) = .empty;
+        defer wait_messages.deinit(alloc);
+        try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &status_indices, &summary, &wait_messages);
+        const counted_messages = try alloc.alloc(bool, wait_messages.items.len);
+        defer alloc.free(counted_messages);
+        @memset(counted_messages, false);
 
         const bytes = try formatGroupBlock(
             alloc,
@@ -5866,17 +7497,22 @@ fn fillProjection(
             detail_indices,
             &output_sources,
             summary,
-            wait_messages,
+            wait_messages.items,
+            counted_messages,
             focused_entry_id,
             collapse_tool_calls,
             cols,
             style,
             styles,
         );
+        hideCountedMessages(projection, wait_messages.items, counted_messages);
         if (bytes.bytes.len == 0) {
             alloc.free(bytes.bytes);
             alloc.free(bytes.lines);
         } else try projection.setOwnedGroup(alloc, first_index, bytes);
+        // The run's own rows are hidden now, so the loop skips them on its
+        // way back to the rows it left out.
+        if (first_left_out) |left_out| index = left_out;
     }
 
     try recapTurnSummaries(alloc, projection, entries, details, detail_indices, cols, checkpoint);
@@ -6125,7 +7761,7 @@ test "a group's rows keep their diff count accents, and a collapsed group's head
         "● Edited files, read a file\n" ++
             "├ Read runtime.zig\n" ++
             "├ Wrote note.txt [G]+143\x1b[0m\n" ++
-            "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+            "└ Edited main.zig [G]+12\x1b[0m/[R]-3\x1b[0m",
         projection.entry_actions.items[0].override.bytes,
     );
 
@@ -6149,7 +7785,7 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     ui_render.diff_removed_marker_style = "[R]";
 
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdocs/release-notes/very-long-file-name.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdocs/release-notes/very-long-release-note-file-name.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;229;72;77m-27\x1b[0m\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
     };
@@ -6164,13 +7800,13 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
 
-    // The phrase ends in the ellipsis and the counts follow it, so each row
-    // fills the width exactly instead of losing its counts to the clip.
+    // Each file shows by its name. A name too long for the row ends in the
+    // ellipsis and the counts follow it, so each row fills the width
+    // exactly instead of losing its counts to the clip.
     try std.testing.expectEqualStrings(
         "● Edited files\n" ++
-            "├ Wrote docs/release-notes/very-lo… [G]+143\x1b[0m\n" ++
-            "├ Edited src/ui/transcript/tool_gro… [R]-27\x1b[0m\n" ++
-            "└ Edited src/ui/transcript/too… [G]+12\x1b[0m / [R]-3\x1b[0m",
+            "├ Wrote very-long-release-note-fil… [G]+143\x1b[0m\n" ++
+            "└ Edited tool_group_p… [G]+12\x1b[0m/[R]-30\x1b[0m · 2 edits",
         bytes,
     );
     var rows = std.mem.splitScalar(u8, bytes, '\n');
@@ -6321,12 +7957,14 @@ test "clipped diff counts fall back to a plain clip below half the row" {
     const both = "● Edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n";
     const wide = "● Edited\x1b[0m \x1b[38;5;245m文档文档文档文档文档文档.md\x1b[0m \x1b[38;2;229;72;77m-7\x1b[0m\n";
     const cases = [_]struct { bytes: []const u8, cols: u16, row: []const u8 }{
-        // A one-call group is its own header line. " +12 / -3" takes 9 of 18
-        // cells: the counts still fit in half the row.
-        .{ .bytes = both, .cols = 18, .row = "● Edited… [G]+12\x1b[0m / [R]-3\x1b[0m" },
+        // A one-call group is its own header line, which names the file and
+        // its counts. " +12/-3" takes 7 of 14 cells: the counts still fit in
+        // half the row.
+        .{ .bytes = both, .cols = 18, .row = "● Edited m… [G]+12\x1b[0m/[R]-3\x1b[0m" },
+        .{ .bytes = both, .cols = 14, .row = "● Edit… [G]+12\x1b[0m/[R]-3\x1b[0m" },
         // One cell narrower, the counts would take more than half the row,
         // so the row clips from the right like any other row.
-        .{ .bytes = both, .cols = 17, .row = "● Edited main.zi…" },
+        .{ .bytes = both, .cols = 13, .row = "● Edited mai…" },
         .{ .bytes = both, .cols = 12, .row = "● Edited ma…" },
         // A two-cell glyph that would cross the cut is dropped whole.
         .{ .bytes = wide, .cols = 20, .row = "● Edited 文档文… [R]-7\x1b[0m" },
@@ -6341,6 +7979,7 @@ test "clipped diff counts fall back to a plain clip below half the row" {
         var projection = try build(alloc, &entries, &details, case.cols);
         defer projection.deinit(alloc);
         const row = projection.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("cols {d}: {s}\n", .{ case.cols, row });
         try std.testing.expect(std.mem.findScalar(u8, row, '\n') == null);
         try std.testing.expectEqualStrings(case.row, row);
         try std.testing.expect(try widthWithoutTestMarkersForTest(alloc, row) <= case.cols);
@@ -6556,7 +8195,7 @@ test "a command still running when its call returned gets no check mark" {
     defer alloc.free(group_text);
     errdefer std.debug.print("group:\n{s}\n", .{group_text});
     const trimmed = std.mem.trim(u8, group_text, "\n");
-    try std.testing.expectEqualStrings("● Still running echo, sleep, printf", trimmed);
+    try std.testing.expectEqualStrings("● Still running echo, sleep, printf · 2 calls", trimmed);
 
     // Alone, the row is the header, and it gets no ✓ either.
     var single = try build(alloc, entries[1..], details[1..], 120);
@@ -6582,9 +8221,9 @@ test "edit rows name the file, and changes to one file share a row" {
         .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed " ++ app_path ++ ": old_string not found\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .resolved_path = @constCast(main_path), .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .outcome = .completed },
-        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .resolved_path = @constCast(main_path), .outcome = .completed },
         .{ .entry_id = 4, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(failed_args), .outcome = .failed },
     };
 
@@ -6688,9 +8327,9 @@ test "a file outside the project shows by its name when core names its real path
         .{ .raw_bytes = .{ .id = 3, .bytes = "● Wrote /private/tmp/pr-body-steer.md +7 / -3\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .outcome = .completed },
-        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
-        .{ .entry_id = 3, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(body_args), .outcome = .completed },
+        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .resolved_path = @constCast("/private/tmp/steer-ab2.ts"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .resolved_path = @constCast("/private/tmp/followup-checks.sh"), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(body_args), .resolved_path = @constCast("/private/tmp/pr-body-steer.md"), .outcome = .completed },
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
@@ -6700,7 +8339,7 @@ test "a file outside the project shows by its name when core names its real path
     try std.testing.expectEqualStrings("├ Wrote steer-ab2.ts +80", rows.next().?);
     try std.testing.expectEqualStrings("├ Read followup-checks.sh", rows.next().?);
     try std.testing.expectEqualStrings("└ Wrote pr-body-steer.md +7/-3", rows.next().?);
-    // The name links to the path core named, where the file really is.
+    // The name links to the file core resolved, where the file really is.
     var compact = try build(alloc, &entries, &details, 120);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.entry_actions.items[0].override.bytes, "file:///private/tmp/steer-ab2.ts") != null);
@@ -6906,7 +8545,7 @@ test "a toolbox run of a built-in tool reads as a direct call of it, by the tool
         .{ .status = "● Read notes.txt\n", .tool_name = "read_file", .activity_kind = .read, .arguments_json = "{\"path\":\"notes.txt\"}", .outcome = .completed, .row = "● Read notes.txt" },
         // An MCP tool's run keeps toolbox's record and reads as a direct
         // call of that tool.
-        .{ .status = "● Failed mcp_fixture_echo\n", .tool_name = "toolbox", .activity_kind = .mcp, .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .outcome = .failed, .row = "● Couldn't run mcp_fixture_echo" },
+        .{ .status = "● Failed mcp_fixture_echo\n", .tool_name = "toolbox", .activity_kind = .mcp, .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .outcome = .failed, .row = "● Couldn't use Fixture to echo" },
     };
     for (cases) |case| {
         const entry = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = case.status, .class = .tool_status } };
@@ -6989,7 +8628,7 @@ test "a call joins its row at once, without a row of its own first" {
         };
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Running echo, sleep", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● Running echo, sleep · 2 calls", std.mem.trim(u8, text, "\n"));
     }
     // A read, a search, and an edit with no arguments yet wait in the row
     // they will join, so the group keeps one line.
@@ -7865,20 +9504,25 @@ test "a cancelled command's notice drops only the command and keeps the line's s
     // The line a cancelled terminal writes, and the turn's own notice.
     try std.testing.expectEqualStrings(
         try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled", reset, follow_up }),
-        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }))).?,
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }), "")).?,
     );
     // A summary with styles of its own keeps them, with no text between.
     try std.testing.expectEqualStrings(
         try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m\x1b[38;5;245m\x1b[0m", reset, follow_up }),
-        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }))).?,
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }), "")).?,
+    );
+    // A name in place of core's sits in the line's styles.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled using Fixture to echo", reset, follow_up }),
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled mcp_fixture_echo", reset, follow_up }), "using Fixture to echo")).?,
     );
     // A line already without a command, and one an older fx saved with no
     // follow-up.
-    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledCommandNotice(a, "▪ Cancelled · What can fx do differently?")).?);
-    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledCommandNotice(a, "■ Cancelled sleep 30\n")).?);
+    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledNotice(a, "▪ Cancelled · What can fx do differently?", "")).?);
+    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledNotice(a, "■ Cancelled sleep 30\n", "")).?);
     // A line that doesn't read `Cancelled …` after its mark stays as it is.
-    try std.testing.expect(try cancelledCommandNotice(a, "▪ Stopped sleep 30") == null);
-    try std.testing.expect(try cancelledCommandNotice(a, "cancelled") == null);
+    try std.testing.expect(try cancelledNotice(a, "▪ Stopped sleep 30", "") == null);
+    try std.testing.expect(try cancelledNotice(a, "cancelled", "") == null);
 }
 
 test "only a cancelled command's notice leaves out its text, in a group with an MCP call" {
@@ -7899,9 +9543,10 @@ test "only a cancelled command's notice leaves out its text, in a group with an 
     const bytes = projection.entry_actions.items[0].override.bytes;
 
     // Each command's notice names no command, and the MCP call's names its
-    // tool, as before.
+    // server and tool, as its row does.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n\n▪ Cancelled · What can fx do differently?"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled mcp_fixture_echo · What can fx do differently?"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled using Fixture to echo · What can fx do differently?"));
+    try std.testing.expect(std.mem.find(u8, bytes, "Cancelled mcp_fixture_echo") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "> out.txt") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "Cancelled sleep 30 ·") == null);
 }
@@ -8871,7 +10516,7 @@ test "commands one after the other share a row, and reads show the file by name"
         .{ .raw_bytes = .{ .id = 6, .bytes = "● Ran nl -ba src/b.zig\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\",\"start_line\":15,\"line_count\":186}"), .outcome = .completed },
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\",\"start_line\":15,\"line_count\":186}"), .resolved_path = @constCast(path), .outcome = .completed },
         storyCommandDetail(2, "{\"command\":\"rg -n retry src\"}", 0, null),
         storyCommandDetail(3, "{\"command\":\"sed -n 1,40p src/a.zig\"}", 0, null),
         storyCommandDetail(4, "{\"command\":\"rg -n backoff src\"}", 0, null),
@@ -8889,9 +10534,9 @@ test "commands one after the other share a row, and reads show the file by name"
         "├ Read \x1b]8;;file:///Users/example/fx%20worktree/src/core/agent/runtime/orchestrator.zig\x1b\\orchestrator.zig" ++ link_close ++ " L15-200",
         rows.next().?,
     );
-    // The passing commands before the failure share one row, each step once.
-    // rg ran again after sed, so it is the newest step.
-    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252msed\x1b[39m, \x1b[38;5;252mrg\x1b[39m", rows.next().?);
+    // The passing commands before the failure share one row, each step once,
+    // and count their calls. rg ran again after sed, so it is the newest step.
+    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252msed\x1b[39m, \x1b[38;5;252mrg\x1b[39m · 3 calls", rows.next().?);
     // The failure keeps its own row and reason line, and the command after it
     // starts a new row.
     try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ Exited 1 "));
@@ -9181,7 +10826,7 @@ test "a running toolbox run of an MCP tool joins that tool's row before its argu
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Running MCP mcp_fixture_echo ×3", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● Using Fixture to echo ×3", std.mem.trim(u8, text, "\n"));
 }
 
 test "toolbox lookups and wrapped arguments name what the group did" {
@@ -9685,6 +11330,8 @@ fn storyReadDetailForTest(entry_id: u32, comptime path: []const u8) ToolDetailRe
         .tool_name = @constCast("read_file"),
         .activity_kind = .read,
         .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\"}"),
+        // A finished read names the file core read.
+        .resolved_path = @constCast(path),
         .outcome = .completed,
     };
 }
@@ -9711,10 +11358,10 @@ test "a message the user sends mid-turn starts a new group for the calls after i
 
 test "a resumed subagent report keeps its own line after main's calls" {
     // Live, main's calls share a presentation group and a report's row has
-    // none, so the report shows on a line of its own. Resumed rows have no
-    // presentation group, so they must split at the reports the same way:
-    // reports in a row still share a group, as they do live, and main's
-    // calls after them start their own.
+    // none, so the report shows on a line of its own after the group, even
+    // when main's calls go on after it. Resumed rows have no presentation
+    // group, so they must group the same way, and reports in a row still
+    // share a group, as they do live.
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to reviewer · review the change\n", .class = .tool_status } },
@@ -9745,17 +11392,16 @@ test "a resumed subagent report keeps its own line after main's calls" {
         storyReadDetailForTest(5, "desktop/src/window.ts"),
     };
     details[3].entry_id = 4;
-    const text = try groupTextForTest(alloc, &entries, &details);
-    defer alloc.free(text);
-    try std.testing.expectEqualStrings(
-        "● Messaged a subagent, read a file\n" ++
+    try expectLiveAndResumedRowsForTest(
+        alloc,
+        &entries,
+        &details,
+        "● Read files, messaged a subagent\n" ++
             "├ Messaged reviewer\n" ++
-            "└ Read main.ts\n" ++
+            "└ Read main.ts, window.ts\n" ++
             "● Got subagent updates\n" ++
             "├ reviewer finished\n" ++
-            "└ tester finished\n" ++
-            "● Read window.ts",
-        std.mem.trim(u8, text, "\n"),
+            "└ tester finished",
     );
 }
 
@@ -10151,7 +11797,7 @@ test "waits and the messages they took read as one row that counts the messages"
     }
 }
 
-test "messages join the wait row of the group before them, and anything else ends the run" {
+test "a message from a subagent the waits did not name keeps its own line after their group" {
     const alloc = std.testing.allocator;
     const wait = "{\"action\":\"wait\"}";
     const entries = [_]TranscriptEntry{
@@ -10170,18 +11816,537 @@ test "messages join the wait row of the group before them, and anything else end
         reportDetailForTest(5),
         subagentDetailForTest(6, wait, .completed),
     };
-    const text = try groupTextForTest(alloc, &entries, &details);
-    defer alloc.free(text);
-    // A message from a subagent the wait did not name keeps its own line,
-    // and so does the wait after it.
-    try std.testing.expectEqualStrings(
+    // The wait after it stays in the group, as it does live.
+    try expectLiveAndResumedRowsForTest(
+        alloc,
+        &entries,
+        &details,
         "● Messaged a subagent\n" ++
             "├ Messaged lander\n" ++
             "└ Waited for lander · 1 message\n" ++
-            "● Message from scout\n" ++
-            "● Waited for lander",
-        std.mem.trim(u8, text, "\n"),
+            "● Message from scout",
     );
+}
+
+test "a wait the user stopped reads as stopping the wait, never as cancelling the subagent" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    // A wait, a message it took, and a wait the user stopped: the stopped
+    // wait's row counts the message, and its notice names no subagent.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the checks."),
+            .{ .raw_bytes = .{ .id = 4, .bytes = "▪ Cancelled lander · What can fx do differently?\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait, .cancelled),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent · 1 cancelled\n" ++
+                "├ Started lander\n" ++
+                "└ Stopped waiting for lander · 1 message\n\n" ++
+                "▪ Cancelled · What can fx do differently?",
+        );
+    }
+    // One alone, whose host named no subagents.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled subagents · What can fx do differently?\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{subagentDetailForTest(1, wait, .cancelled)};
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Stopped waiting for subagents\n\n" ++
+                "▪ Cancelled · What can fx do differently?",
+        );
+    }
+    // A message the user stopped keeps core's words: its subagent got no
+    // message.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled lander · What can fx do differently?\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{subagentDetailForTest(1, to_lander, .cancelled)};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expect(std.mem.find(u8, text, "Stopped waiting") == null);
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, text, "\n"), "● Cancelled lander"));
+    }
+}
+
+test "a message counts only on a wait row that waits for its sender" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const wait_for_scout = "{\"action\":\"wait\",\"agent\":\"scout\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    const to_scout = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map the tray\"}";
+    // Two subagents: the bare row ends waiting for scout, so it counts
+    // scout's message, and lander's keeps its own line.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "sent to scout · Map the tray"),
+            waitChainEntryForTest(3, "waited for lander, scout"),
+            waitChainEntryForTest(4, "from lander · On the checks."),
+            waitChainEntryForTest(5, "waited for lander, scout"),
+            waitChainEntryForTest(6, "from scout · Tray mapped."),
+            waitChainEntryForTest(7, "waited for lander, scout"),
+            waitChainEntryForTest(8, "lander completed · Landed."),
+            waitChainEntryForTest(9, "waited for scout"),
+            waitChainEntryForTest(10, "scout completed · Mapped."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, to_scout, .completed),
+            subagentDetailForTest(3, wait, .completed),
+            reportDetailForTest(4),
+            subagentDetailForTest(5, wait, .completed),
+            reportDetailForTest(6),
+            subagentDetailForTest(7, wait, .completed),
+            reportDetailForTest(8),
+            subagentDetailForTest(9, wait, .completed),
+            reportDetailForTest(10),
+        };
+        details[0].subagent_started = true;
+        details[1].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started subagents\n" ++
+                "├ Started lander\n" ++
+                "├ Started scout\n" ++
+                "└ Waited for scout · 1 message\n" ++
+                "● Message from lander\n" ++
+                "● lander finished\n" ++
+                "● scout finished",
+        );
+    }
+    // A wait that names scout holds no message from lander, even when its
+    // phrase lists every subagent at work.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "sent to scout · Map the tray"),
+            waitChainEntryForTest(3, "waited for lander, scout"),
+            waitChainEntryForTest(4, "from lander · On the checks."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, to_scout, .completed),
+            subagentDetailForTest(3, wait_for_scout, .completed),
+            reportDetailForTest(4),
+        };
+        details[0].subagent_started = true;
+        details[1].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent\n" ++
+                "├ Started lander\n" ++
+                "└ Waited for lander, scout\n" ++
+                "● Message from lander",
+        );
+        // A later bare wait that lists lander counts it.
+        const more = entries ++ [_]TranscriptEntry{waitChainEntryForTest(5, "waited for lander, scout")};
+        const more_details = details ++ [_]ToolDetailRecord{subagentDetailForTest(5, wait, .completed)};
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &more,
+            &more_details,
+            "● Started a subagent\n" ++
+                "├ Started lander\n" ++
+                "├ Waited for lander, scout\n" ++
+                "└ Waited for lander, scout · 1 message",
+        );
+    }
+    // A wait whose host named no subagents holds a message from any.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "waited for subagents"),
+            waitChainEntryForTest(2, "from lander · On the checks."),
+            waitChainEntryForTest(3, "waited for subagents"),
+        };
+        const details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, wait, .completed),
+            reportDetailForTest(2),
+            subagentDetailForTest(3, wait, .completed),
+        };
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, "● Waited for subagents · 1 message");
+    }
+}
+
+/// Checks that `entries` show as `want` both live, where main's calls share
+/// one presentation group and a subagent's reports and messages have none,
+/// and after a resume, where no row has one.
+fn expectLiveAndResumedRowsForTest(alloc: std.mem.Allocator, entries: []const TranscriptEntry, details: []const ToolDetailRecord, want: []const u8) !void {
+    const resumed = try groupTextForTest(alloc, entries, details);
+    defer alloc.free(resumed);
+    try std.testing.expectEqualStrings(want, std.mem.trim(u8, resumed, "\n"));
+    const live_details = try alloc.dupe(ToolDetailRecord, details);
+    defer alloc.free(live_details);
+    for (live_details) |*detail| {
+        if (!detail.subagent_report) detail.presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 1 };
+    }
+    const live = try groupTextForTest(alloc, entries, live_details);
+    defer alloc.free(live);
+    try std.testing.expectEqualStrings(want, std.mem.trim(u8, live, "\n"));
+}
+
+test "resumed waits keep the group they have live, with the messages and reports that came between them" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const wait_for_lander = "{\"action\":\"wait\",\"agent\":\"lander\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    const to_scout = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map the tray\"}";
+    const check = "{\"command\":\"sh check.sh status\"}";
+    // A bare wait, one that names lander, and a bare wait, with a message
+    // after each of the first two: the start and the named wait share
+    // lander's row, and the bare waits take both messages.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "Ran sh check.sh status"),
+            waitChainEntryForTest(2, "Ran sh check.sh status"),
+            waitChainEntryForTest(3, "sent to lander · Land block B"),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · On the model checks."),
+            waitChainEntryForTest(6, "waited for lander"),
+            waitChainEntryForTest(7, "from lander · Fixes pushed."),
+            waitChainEntryForTest(8, "waited for lander"),
+            waitChainEntryForTest(9, "lander completed · Landed."),
+        };
+        var details = [_]ToolDetailRecord{
+            storyCommandDetail(1, check, 0, "ok"),
+            storyCommandDetail(2, check, 0, "ok"),
+            subagentDetailForTest(3, to_lander, .completed),
+            subagentDetailForTest(4, wait, .completed),
+            reportDetailForTest(5),
+            subagentDetailForTest(6, wait_for_lander, .completed),
+            reportDetailForTest(7),
+            subagentDetailForTest(8, wait, .completed),
+            reportDetailForTest(9),
+        };
+        details[2].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Ran commands, waited for a subagent ✓\n" ++
+                "├ Ran sh check.sh status ×2\n" ++
+                "├ Waited for lander\n" ++
+                "└ Waited for lander · 2 messages\n" ++
+                "● lander finished",
+        );
+    }
+    // A wait that names lander, then a bare wait: the bare wait's row counts
+    // the message the named wait took too.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+            waitChainEntryForTest(6, "lander completed · Landed."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait_for_lander, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait, .completed),
+            reportDetailForTest(5),
+            reportDetailForTest(6),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Waited for a subagent\n" ++
+                "├ Waited for lander\n" ++
+                "└ Waited for lander · 2 messages\n" ++
+                "● lander finished",
+        );
+    }
+    // Two subagents that each send a message.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "sent to scout · Map the tray"),
+            waitChainEntryForTest(3, "waited for lander, scout"),
+            waitChainEntryForTest(4, "from scout · Half mapped."),
+            waitChainEntryForTest(5, "from lander · On the model checks."),
+            waitChainEntryForTest(6, "waited for lander, scout"),
+            waitChainEntryForTest(7, "scout completed · Mapped."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, to_scout, .completed),
+            subagentDetailForTest(3, wait, .completed),
+            reportDetailForTest(4),
+            reportDetailForTest(5),
+            subagentDetailForTest(6, wait, .completed),
+            reportDetailForTest(7),
+        };
+        details[0].subagent_started = true;
+        details[1].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started subagents\n" ++
+                "├ Started lander\n" ++
+                "├ Started scout\n" ++
+                "└ Waited for lander, scout · 2 messages\n" ++
+                "● scout finished",
+        );
+    }
+    // A report between the waits, and one that came with a message the
+    // next wait's row takes, which shows only there.
+    for ([_]bool{ false, true }) |with_message| {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "sent to scout · Map the tray"),
+            waitChainEntryForTest(3, "waited for lander, scout"),
+            waitChainEntryForTest(4, "scout completed · Mapped."),
+            if (with_message) waitChainEntryForTest(5, "from lander · On the model checks.") else waitChainEntryForTest(5, "waited for lander"),
+            if (with_message) waitChainEntryForTest(6, "waited for lander") else waitChainEntryForTest(6, "from lander · On the model checks."),
+            waitChainEntryForTest(7, "waited for lander"),
+            waitChainEntryForTest(8, "lander completed · Landed."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, to_scout, .completed),
+            subagentDetailForTest(3, wait, .completed),
+            reportDetailForTest(4),
+            if (with_message) reportDetailForTest(5) else subagentDetailForTest(5, wait, .completed),
+            if (with_message) subagentDetailForTest(6, wait, .completed) else reportDetailForTest(6),
+            subagentDetailForTest(7, wait, .completed),
+            reportDetailForTest(8),
+        };
+        details[0].subagent_started = true;
+        details[1].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started subagents\n" ++
+                "├ Started lander\n" ++
+                "├ Started scout\n" ++
+                "└ Waited for lander · 1 message\n" ++
+                "● scout finished\n" ++
+                "● lander finished",
+        );
+    }
+}
+
+test "the row of a group's last wait counts every message the group's waits took" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const wait_for_lander = "{\"action\":\"wait\",\"agent\":\"lander\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    // A bare wait, then a wait that names lander: lander's row holds the
+    // last wait, so it counts both messages.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait_for_lander, .completed),
+            reportDetailForTest(5),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Waited for a subagent\n" ++
+                "├ Waited for lander · 2 messages\n" ++
+                "└ Waited for lander",
+        );
+    }
+    // A group that goes on after its wait: the wait's row still counts the
+    // message it took, and a message that came after the group's last call
+    // was not a wait's, so it keeps its own line.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "Read desktop/src/main.ts"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            storyReadDetailForTest(4, "desktop/src/main.ts"),
+            reportDetailForTest(5),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent, read a file\n" ++
+                "├ Started lander\n" ++
+                "├ Waited for lander · 1 message\n" ++
+                "└ Read main.ts\n" ++
+                "● Message from lander",
+        );
+    }
+    // A later message to lander takes over the row the named wait shared,
+    // so the last row that still reads as a wait counts the messages.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+            waitChainEntryForTest(6, "sent to lander · Merge it"),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait_for_lander, .completed),
+            reportDetailForTest(5),
+            subagentDetailForTest(6, "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Merge it\"}", .completed),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Messaged a subagent\n" ++
+                "├ Messaged lander\n" ++
+                "└ Waited for lander · 2 messages",
+        );
+    }
+    // Each wait lists whom it waited for, whatever row it shares, so the
+    // bare wait after scout starts takes scout's message too.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "sent to scout · Map the tray"),
+            waitChainEntryForTest(5, "waited for lander, scout"),
+            waitChainEntryForTest(6, "from scout · Half mapped."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait_for_lander, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map the tray\"}", .completed),
+            subagentDetailForTest(5, wait, .completed),
+            reportDetailForTest(6),
+        };
+        details[0].subagent_started = true;
+        details[3].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent\n" ++
+                "├ Waited for lander\n" ++
+                "├ Started scout\n" ++
+                "└ Waited for lander, scout · 2 messages",
+        );
+    }
+    // A message that came before the group's first wait, while main read a
+    // file, was not a wait's, so it keeps its own line.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "Read desktop/src/main.ts"),
+            waitChainEntryForTest(3, "from lander · Starting now."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · On the model checks."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            storyReadDetailForTest(2, "desktop/src/main.ts"),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait, .completed),
+            reportDetailForTest(5),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent, read a file\n" ++
+                "├ Started lander\n" ++
+                "├ Read main.ts\n" ++
+                "└ Waited for lander · 1 message\n" ++
+                "● Message from lander",
+        );
+    }
+}
+
+test "messages keep their own lines when no row of the group reads as a wait" {
+    // A message to lander after the wait that names it takes over the row
+    // they share. On a row that reads "Messaged lander", a count would read
+    // as main's own messages, so lander's message keeps its line.
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        waitChainEntryForTest(1, "sent to lander · Land block B"),
+        waitChainEntryForTest(2, "waited for lander"),
+        waitChainEntryForTest(3, "from lander · Fixes pushed."),
+        waitChainEntryForTest(4, "sent to lander · Merge it"),
+    };
+    var details = [_]ToolDetailRecord{
+        subagentDetailForTest(1, "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}", .completed),
+        subagentDetailForTest(2, "{\"action\":\"wait\",\"agent\":\"lander\"}", .completed),
+        reportDetailForTest(3),
+        subagentDetailForTest(4, "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Merge it\"}", .completed),
+    };
+    details[0].subagent_started = true;
+    try expectLiveAndResumedRowsForTest(alloc, &entries, &details, "● Messaged lander\n● Message from lander");
+}
+
+test "a wait with no presentation group is alone in its run only when no call follows it, past any report" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        waitChainEntryForTest(1, "waited for lander"),
+        waitChainEntryForTest(2, "from lander · On the model checks."),
+        waitChainEntryForTest(3, "Read desktop/src/main.ts"),
+    };
+    const details = [_]ToolDetailRecord{
+        subagentDetailForTest(1, "{\"action\":\"wait\"}", .completed),
+        reportDetailForTest(2),
+        storyReadDetailForTest(3, "desktop/src/main.ts"),
+    };
+    var detail_indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    defer detail_indices.deinit(alloc);
+    for (details, 0..) |detail, index| try detail_indices.put(alloc, detail.entry_id, index);
+    const no_groups = [_]?usize{ null, null, null };
+    // The read after the message joins the wait's run, as fillProjection
+    // groups them.
+    try std.testing.expect(!callIsAloneInGroup(&entries, &details, &detail_indices, &no_groups, &.{}, 0));
+    try std.testing.expect(callIsAloneInGroup(entries[0..2], details[0..2], &detail_indices, no_groups[0..2], &.{}, 0));
 }
 
 test "the result mark shows only beside the commands it is for" {
@@ -10222,10 +12387,11 @@ test "a list row says what its calls did, and links only files that open safely"
     details[2].outcome = null;
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
-    // A runnable file and a file with no extension get no link; the row
-    // reads "Read" while the last read still runs.
+    // A runnable file and a file with no extension get no link, nor does a
+    // read that still runs, whose path core has not resolved yet; the row
+    // reads "Read" while it runs.
     try std.testing.expectEqualStrings(
-        "● Read run.command, fx, \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close,
+        "● Read run.command, fx, a.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -10670,7 +12836,7 @@ test "calls of one MCP tool share a row that counts them" {
     for (0..4) |index| {
         const id: u32 = @intCast(index + 1);
         entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = "● Ran MCP mcp_slack_read_thread\n", .class = .tool_status } };
-        details[index] = .{ .entry_id = id, .tool_name = @constCast("mcp_slack_read_thread"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast("{\"message_ts\":\"1\"}") };
+        details[index] = .{ .entry_id = id, .tool_name = @constCast("mcp_slack_read_thread"), .activity_kind = .mcp, .outcome = .completed, .arguments_json = @constCast("{\"message_ts\":\"1\"}"), .result = @constCast("{\"server\":\"slack\",\"tool\":\"mcp_slack_read_thread\",\"result\":{}}") };
     }
     // A failed call keeps its own row, so what happened to it shows.
     entries[4] = .{ .raw_bytes = .{ .id = 5, .bytes = "● Failed mcp_slack_read_thread: rate limited\n", .class = .tool_status } };
@@ -10678,9 +12844,10 @@ test "calls of one MCP tool share a row that counts them" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "Ran MCP mcp_slack_read_thread ×4") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Ran MCP"));
-    try std.testing.expect(std.mem.find(u8, text, "Couldn't run mcp_slack_read_thread") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Used Slack to read thread ×4") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Used Slack"));
+    // The failed call kept no result to name its server.
+    try std.testing.expect(std.mem.find(u8, text, "Couldn't use an MCP tool") != null);
 }
 
 test "a run that returns while its command goes on stays on the row it joined, and so do its session's calls" {
@@ -10975,13 +13142,14 @@ test "reads of more output keep searches, failures, and folders apart" {
             .{ .entry_id = 3, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = @constCast("{\"url\":\"https://docs.example.com/guide/page\"}"), .outcome = .completed, .result_handle = @constCast("result-3333.txt") },
             .{ .entry_id = 4, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"  result-1111.txt \",\"start_byte\":10}"), .outcome = .completed },
             .{ .entry_id = 5, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-2222.txt\",\"start_byte\":10}"), .outcome = .completed },
-            // Still running: it joins the row.
+            // Still running: it joins the row, which says what its newest
+            // call does.
             .{ .entry_id = 6, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-3333.txt\",\"start_byte\":10}") },
         };
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
         errdefer std.debug.print("folders:\n{s}\n", .{text});
-        try std.testing.expect(std.mem.find(u8, text, "Read more output from SKILL.md, SKILL.md, docs.example.com") != null);
+        try std.testing.expect(std.mem.find(u8, text, "Reading more output from SKILL.md, SKILL.md, docs.example.com") != null);
         try std.testing.expect(std.mem.find(u8, text, "/w/") == null);
     }
     // A failed read keeps a row of its own.
@@ -11019,6 +13187,23 @@ test "a subagent call whose arguments are still coming waits in the latest subag
         errdefer std.debug.print("after status:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
         try std.testing.expect(std.mem.findScalar(u8, std.mem.trim(u8, text, "\n"), '\n') == null);
+    }
+    // Once its arguments end, the call joins the status row while core still
+    // says "Managing", until the call runs; the row says what it does.
+    for ([_]bool{ true, false }) |streaming| {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● checked subagents\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Managing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .streaming = streaming },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("arguments ended (streaming {}):\n{s}\n", .{ streaming, text });
+        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
+        try std.testing.expect(std.mem.find(u8, text, "● Checking subagents") != null);
     }
     // After a message, with a read after it, the call waits in the message's
     // row, not on a row of its own at the end.
@@ -11136,7 +13321,7 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     }
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py · 5 calls", std.mem.trim(u8, text, "\n"));
 
     var narrow = try build(alloc, &entries, &details, 30);
     defer narrow.deinit(alloc);
@@ -11152,7 +13337,9 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     errdefer std.debug.print("narrow group:\n{s}\n", .{painted.items});
     const narrow_text = try visibleLinesForTest(alloc, painted.items, 30);
     defer alloc.free(narrow_text);
-    try std.testing.expectEqualStrings("● Running +4, python3 run.py", std.mem.trim(u8, narrow_text, "\n"));
+    // With no room for the whole newest step and the count, the step clips
+    // and the count stays.
+    try std.testing.expectEqualStrings("● Running +4, pytho… · 5 calls", std.mem.trim(u8, narrow_text, "\n"));
 }
 
 test "a session's input finds its run after a quick command joined the run's row" {

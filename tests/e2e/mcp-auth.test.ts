@@ -30,11 +30,14 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { zigGlobalCacheDir } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
+// How the compact view names that tool: its server, then what the tool does.
+const TOOL_ROW = "Fixture to echo";
 const ACCESS_INITIAL = "mcp-access-initial-secret";
 const ACCESS_REFRESHED = "mcp-access-refreshed-secret";
 const REFRESH_INITIAL = "mcp-refresh-initial-secret";
@@ -2822,13 +2825,13 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the fixture.");
-    await tui.waitForText("First call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call done.") && turnSettled(pane), 20_000);
     // The server stops taking that login and its refresh, so the next call needs a login.
     auth.validTokens.clear();
     options.rejectRefresh = true;
     await tui.waitForComposer(5_000);
     await tui.sendText("Call it again.");
-    await tui.waitForText("It needs a login.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("It needs a login.") && turnSettled(pane), 20_000);
     // Another fx with the same profile signs in, and gets a new token.
     options.rotateAuthorizationToken = true;
     auth.validTokens.add(ACCESS_REFRESHED);
@@ -2867,7 +2870,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the fixture.");
-    await tui.waitForText("First call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call done.") && turnSettled(pane), 20_000);
     // Another fx signs in again and saves a new token; the server then takes
     // only that one, and refuses the shell's refresh.
     options.rotateAuthorizationToken = true;
@@ -2877,7 +2880,7 @@ describe("MCP login", () => {
     options.rejectRefresh = true;
     await tui.waitForComposer(5_000);
     await tui.sendText("Call it again.");
-    await tui.waitForText("Second call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("Second call done.") && turnSettled(pane), 20_000);
     // The shell's own login was refused, and the other fx's stays saved.
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
     await tui.waitForComposer(5_000);
@@ -2911,7 +2914,7 @@ describe("MCP login", () => {
     // The first token stops working, so the shell refreshes and saves the new one.
     auth.validTokens.delete(ACCESS_INITIAL);
     await tui.sendText("Call the fixture.");
-    await tui.waitForText("First call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call done.") && turnSettled(pane), 20_000);
     expect(auth.refreshes).toBe(1);
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
     // Then that one stops too, and its refresh is refused.
@@ -2919,7 +2922,7 @@ describe("MCP login", () => {
     options.rejectRefresh = true;
     await tui.waitForComposer(5_000);
     await tui.sendText("Call it again.");
-    await tui.waitForText("Second call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("Second call done.") && turnSettled(pane), 20_000);
     expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
     // The trace says why the login went, and holds no token.
     const trace = readFileSync(root.trace, "utf8");
@@ -2969,7 +2972,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the fixture.");
-    await tui.waitForText("First call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call done.") && turnSettled(pane), 20_000);
     // The access token runs out for every fx holding it, and another fx
     // refreshes it first.
     auth.validTokens.delete(ACCESS_INITIAL);
@@ -2980,7 +2983,7 @@ describe("MCP login", () => {
     // Then the shell needs a token too.
     await tui.waitForComposer(5_000);
     await tui.sendText("Call it again.");
-    await tui.waitForText("Second call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("Second call done.") && turnSettled(pane), 20_000);
     expect(auth.replays).toBe(0);
     const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
     expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}-1`);
@@ -3240,7 +3243,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the fixture.");
-    await tui.waitForText("First call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call done.") && turnSettled(pane), 20_000);
     auth.validTokens.delete(ACCESS_INITIAL);
     // Another fx keeps the saved logins busy past both waits for them.
     const holder = await holdStoreLock(root, 6);
@@ -3611,7 +3614,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture.");
-    await tui.waitForText("First call complete.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call complete.") && turnSettled(pane), 20_000);
     const deadline = Date.now() + 10_000;
     while (listens().length < 1 && Date.now() < deadline) await Bun.sleep(25);
     expect(listens()).toHaveLength(1);
@@ -3704,7 +3707,7 @@ describe("MCP login", () => {
     const renewalStarted = Date.now();
 
     await tui.sendInterruptEscapePair(10_000);
-    await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+    await tui.waitForText(`Cancelled using ${TOOL_ROW}`, 10_000);
     expect(auth.protectedToolCalls).toBe(0);
     expect(upstream.requests.some((entry) => entry.message.method === "tools/call")).toBe(false);
     expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
@@ -3715,7 +3718,7 @@ describe("MCP login", () => {
 
     // The retry waits for that renewal, which fx drops after its 30 s.
     await tui.sendText("Retry the protected MCP fixture.");
-    await tui.waitForText("Retry ended.", 45_000);
+    await tui.waitForPane((pane) => pane.includes("Retry ended.") && turnSettled(pane), 45_000);
     const waited = Date.now() - renewalStarted;
     expect(waited).toBeGreaterThan(28_000);
     expect(waited).toBeLessThan(40_000);

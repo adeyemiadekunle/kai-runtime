@@ -57,13 +57,30 @@ const excerpt_max = 80;
 /// Bytes of a progress note the host is shown, before "...".
 const note_max = 160;
 
-/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: never
-/// a cut UTF-8 sequence, control bytes as '?', and "..." when cut.
+/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: valid
+/// UTF-8 that never ends in a cut sequence, control bytes and bytes that are no
+/// part of a sequence as '?', and "..." when cut. A server's line may hold
+/// bytes that are not UTF-8, and the excerpt goes into a JSON string.
 fn excerptOf(comptime max: usize, buf: *[max + 3]u8, line: []const u8) []const u8 {
     const n = process.maskedPrefix(buf[0..max], line).len;
+    maskBytesOutsideSequences(buf[0..n]);
     if (n == line.len) return buf[0..n];
     @memcpy(buf[n..][0..3], "...");
     return buf[0 .. n + 3];
+}
+
+/// Each byte of `text` that is not part of a valid UTF-8 sequence becomes '?'.
+fn maskBytesOutsideSequences(text: []u8) void {
+    var at: usize = 0;
+    while (at < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[at]) catch 0;
+        if (len != 0 and at + len <= text.len and std.unicode.utf8ValidateSlice(text[at..][0..len])) {
+            at += len;
+        } else {
+            text[at] = '?';
+            at += 1;
+        }
+    }
 }
 
 pub const Link = union(enum) {
@@ -239,6 +256,9 @@ const Logical = struct {
     /// refuses it (`httpListRefusal`). Null when the ending is no answer, or another flow reads it.
     list_why: ?tools.Refusal = null,
     list_status: u16 = 0,
+    /// A line fx could not read, that names no request, came while this request could be the only one it
+    /// was about: on its own stream, or when it was the one request in flight (`markOwnLine`).
+    own_line: bool = false,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -327,6 +347,9 @@ pub const Server = struct {
     /// The message of an invalid reply's answer, kept as long as the line it
     /// came from: until the process is read again.
     refused_reply: [512]u8 = undefined,
+    /// Why the line is unreadable, while `onRefusedLine` hands the answer it made of that line to a request. A list that
+    /// meets it was matched but not read, so it says so (`pageEvent`) and does not say the server answered with an error.
+    refused_decode: ?wire.DecodeError = null,
     /// The length of the last refused line that named no request. A call whose grace runs out
     /// takes it into `Logical.refused_bytes`; it is the last such line the server wrote, not
     /// necessarily the one that gave that call its grace.
@@ -864,19 +887,38 @@ pub const Server = struct {
         }
     }
 
+    /// A line that names no request is about every normal request in flight (`request.Table.refusedLine`), so it is
+    /// a list's own answer only when no other such request could have written it: it came on the list's own
+    /// stream, or the list is the one normal request in flight. A listen is not one of them: it is waited on for no
+    /// reply, and a modern server always has one open. Otherwise the list's answer is only late, and when the grace
+    /// runs out the list ends with no reason, as a lost page does (`tests/tla/mcp/Catalog.tla` `PageSharedGrace`).
+    fn markOwnLine(r: *Server, stream: ?u64) void {
+        const own = if (stream) |key| r.logicalFor(key) else if (r.table.normalInFlightCount() == 1) r.soleList() else null;
+        if (own) |l| l.own_line = true;
+    }
+
+    fn soleList(r: *Server) ?*Logical {
+        for (&r.logicals) |*l| if (l.used and l.what == .list and l.id != null) return l;
+        return null;
+    }
+
     /// A line `decode` refused that names a request in flight is that
     /// request's answer, an invalid one: the request fails with what was
-    /// wrong and the start of the line. One that names a request not in
-    /// flight is ignored, and so is one on an HTTP request's stream that names
-    /// another request (`stream` is that request's key). One that names none
-    /// gives a short deadline (`request.Timeouts.refused_ms`) to each normal
-    /// request in flight, or, on an HTTP request's stream, to that request alone.
+    /// wrong and the start of the line. It names a request by the id read
+    /// before the line went wrong (`wire.responseId`), so a reply cut or
+    /// broken after its id ends at once. One that names a request not in
+    /// flight is ignored, as a late reply is, and so is one on an HTTP request's
+    /// stream that names another request (`stream` is that request's key). One that
+    /// names none gives a short deadline (`request.Timeouts.refused_ms`) to each normal
+    /// request in flight, or, on an HTTP request's stream, to that request alone
+    /// (`tests/tla/mcp/Request.tla` `RefusedNaming`, `RefusedLine`).
     fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8, stream: ?u64) Error!void {
         // Empty for a process that has gone since.
         if (line.len == 0) return;
         const id = wire.responseId(line) orelse {
             r.keepStray(line);
             r.refused_bytes = @intCast(@min(line.len, std.math.maxInt(u32)));
+            r.markOwnLine(stream);
             return r.stepRequest(.{ .refused_line = stream });
         };
         if (r.logicalFor(id) == null) return r.keepStray(line);
@@ -895,6 +937,8 @@ pub const Server = struct {
         const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(excerpt_max, &buf, line) }) catch unreachable;
         var w: std.Io.Writer = .fixed(&r.refused_reply);
         std.json.Stringify.value(plain, .{}, &w) catch unreachable;
+        r.refused_decode = err;
+        defer r.refused_decode = null;
         try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
     }
 
@@ -981,7 +1025,7 @@ pub const Server = struct {
             // Answers were read on arrival; the probe timer covers silence.
             .discover => {},
             .initialize => if (outcome == .timed_out) try r.stepEra(.initialize_timed_out),
-            .list => if (!answered) try r.stepCatalog(.page_failed),
+            .list => if (!answered) try r.listFailed(l),
             // The server's notifications/cancelled. A lost one waits
             // for the process, and a listen never times out.
             .listen => if (outcome == .ended) try r.stepSubs(.{ .final = .{ .id = id, .end = .server_cancelled } }),
@@ -1056,6 +1100,7 @@ pub const Server = struct {
         r.detector.step(.operation_sent, &out) catch return error.NotReady;
         if (r.tracer()) |t| try era.writeTrace(t, r.era_instance, &out);
         l.id = try r.newRequest(.normal);
+        l.own_line = false;
         try r.stepLegacy(.{ .send = l.id.? });
     }
 
@@ -1153,6 +1198,7 @@ pub const Server = struct {
             else => .normal,
         });
         l.id = id;
+        l.own_line = false;
         if (l.what == .listen) {
             l.listen_id = id;
             try r.stepSubs(if (l.resend) .{ .resent = .{ .sub = l.sub, .id = id } } else .{ .opened = .{ .sub = l.sub, .id = id, .filter = l.filter } });
@@ -1407,6 +1453,10 @@ pub const Server = struct {
     fn pageEvent(r: *Server, body: @FieldType(wire.Response, "body")) Error!catalog.Event {
         switch (body) {
             .failure => |f| {
+                if (r.refused_decode) |err| {
+                    r.refuse(tools.refusalOf(err), 0);
+                    return .page_refused;
+                }
                 if (f.code == wire.code.invalid_params and r.catalog.pending == .next) {
                     // The first invalid cursor only restarts the listing, which refuses nothing, so the words stay
                     // those of the last refusal. A second one, after the restart, refuses the list.
@@ -2174,6 +2224,10 @@ pub const Server = struct {
             .malformed => if (r.logicalFor(effect.deliver.id)) |l| {
                 l.malformed = true;
                 l.refused_bytes = r.refused_bytes;
+                // The server wrote a line fx could not read and no id could tell whose it was. For a list, that is an
+                // answer fx could not use (`tests/tla/mcp/Catalog.tla` `PageUnreadable`) only when the line could be
+                // nobody else's (`markOwnLine`); a call's bad reply that gave the list a grace says nothing about it.
+                if (l.what == .list and l.own_line) l.list_why = .unreadable;
             },
             else => {},
         };
@@ -2472,6 +2526,227 @@ test "a line with no readable id gives a grace to the request whose stream carri
     try std.testing.expectEqual(@as(usize, 2), refusedTimers(&r));
     try std.testing.expect(holdsGrace(&r, 1));
     try std.testing.expect(holdsGrace(&r, 3));
+}
+
+test "an excerpt of a line is valid UTF-8: a byte that is no part of a sequence, and a control byte, show as ?" {
+    var buf: [20 + 3]u8 = undefined;
+    const got = excerptOf(20, &buf, "a\xffb\xc3\xa9\xe2\x82c\x1b");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+    try std.testing.expectEqualStrings("a?b\xc3\xa9??c?", got);
+    // Cut at the limit, with a lead byte whose sequence would run past it.
+    var short: [4 + 3]u8 = undefined;
+    const cut = excerptOf(4, &short, "ab\xe2\x82\xac\xe2\x82\xac");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+fn stdioTestServer(r: *Server) !void {
+    // Nothing starts the process: only the requests and their lines are real.
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .stdio = .{ .argv = &.{"fx-test-never-started"} } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+}
+
+/// A `tools/list` waiting for its answer on a stdio server, and its request's id.
+fn listInFlight(r: *Server) !request.Id {
+    const l = try listLogical(r);
+    l.id = try r.newRequest(.normal);
+    return l.id.?;
+}
+
+fn refusalError(line: []const u8) wire.DecodeError {
+    if (wire.decode(line)) |_| unreachable else |err| return err;
+}
+
+test "a list reply that fx matched by its id but could not read ends the list at once, with the words of an unreadable list" {
+    const alloc = std.testing.allocator;
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(alloc);
+    try deep.appendSlice(alloc, "\"jsonrpc\":\"2.0\",\"result\":");
+    try deep.appendNTimes(alloc, '[', 5000);
+    try deep.appendNTimes(alloc, ']', 5000);
+    const cases = [_]struct { rest: []const u8, words: []const u8 }{
+        // Bad parts after the id: not JSON, nested past the scanner's stack, a repeated key.
+        .{ .rest = "\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[nope]}", .words = "the answer is not a readable tool list" },
+        .{ .rest = deep.items, .words = "the answer is not a readable tool list" },
+        .{ .rest = "\"jsonrpc\":\"2.0\",\"result\":{},\"result\":{}", .words = "a field is written twice" },
+        // A line that decodes but is no reply, as a server's error is not what it said.
+        .{ .rest = "\"jsonrpc\":\"1.0\",\"result\":{\"tools\":[]}", .words = "the answer is not a readable tool list" },
+    };
+    for (cases) |case| {
+        var r: Server = undefined;
+        try stdioTestServer(&r);
+        defer r.deinit();
+        const id = try listInFlight(&r);
+        const line = try alloc.print("{{\"id\":{d},{s}}}", .{ id, case.rest });
+        defer alloc.free(line);
+        try r.onRefusedLine(refusalError(line), line, null);
+        // The list ended with its refusal, and no grace is left waiting for 30 s.
+        try std.testing.expect(r.logicalFor(id) == null);
+        try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
+        try std.testing.expect(r.catalog.refused);
+        try std.testing.expectEqualStrings(case.words, r.listRefusal() orelse return error.TestExpectedRefusal);
+    }
+}
+
+test "a refused line that names no request in flight is ignored, and gives no grace to the requests that are" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+
+    // An id read before the bad part, for a request that is not in flight, is a stray like any late reply.
+    const stray = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":nope}}", .{id + 1});
+    try r.onRefusedLine(error.InvalidJson, stray, null);
+    try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
+    try std.testing.expect(!holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+
+    // Lines that name nothing, however it comes about, still give it a grace.
+    const after = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"result\":nope,\"id\":{d}}}", .{id});
+    try r.onRefusedLine(error.InvalidJson, after, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
+}
+
+test "two ids on a refused line name no request, and give every request in flight a grace" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+    const twice = try std.mem.print(&line, "{{\"id\":{d},\"id\":{d},\"result\":nope}}", .{ id, id });
+    try r.onRefusedLine(error.InvalidJson, twice, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+}
+
+/// Ends the grace of the one refused line the server holds, as the server's own loop does when its timer is due.
+fn fireRefusedTimer(r: *Server) !void {
+    for (r.timers.items, 0..) |t, at| if (t.kind == .request and t.kind.request.kind == .refused) {
+        _ = r.timers.swapRemove(at);
+        return r.stepRequest(.{ .timer_fired = t.kind.request });
+    };
+    return error.TestExpectedRefusedTimer;
+}
+
+/// An HTTP server with room for requests, so a list can be in flight on a stream.
+fn streamTestServer(r: *Server) !void {
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+}
+
+test "a list whose line has its id after the part fx cannot read is refused when the grace runs out, with the words of an unreadable list" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+    // The id comes after the bad part, so the line names no request: the list waits out the grace, and says nothing meanwhile.
+    const unnamed = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"result\":nope,\"id\":{d}}}", .{id});
+    try r.onRefusedLine(error.InvalidJson, unnamed, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+    try std.testing.expect(r.listRefusal() == null);
+
+    try fireRefusedTimer(&r);
+    try std.testing.expect(r.logicalFor(id) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "a list that ends with no line fx could read is not refused: a lost process says nothing about the list" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    try r.stepRequest(.{ .transport_lost = id });
+    try std.testing.expect(r.logicalFor(id) == null);
+    try std.testing.expect(!r.catalog.refused);
+    try std.testing.expect(r.listRefusal() == null);
+}
+
+test "a list whose SSE event names no request is refused when its grace runs out, as a stdio line is" {
+    var r: Server = undefined;
+    try streamTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    // The list's POST is out, as it is while its stream is read; nothing here sends it.
+    r.logicalFor(id).?.exchange.phase = .posted;
+    // An event on the list's own stream that is no JSON-RPC message: the stream says which request it is about.
+    try r.onRefusedLine(error.InvalidJson, "not json", id);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.listRefusal() == null);
+
+    try fireRefusedTimer(&r);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+/// Ends every grace the server holds, as its loop does when each timer is due.
+fn fireAllRefusedTimers(r: *Server) !void {
+    while (refusedTimers(r) > 0) try fireRefusedTimer(r);
+}
+
+/// A call in flight beside the list, as a second request on the one stdio connection.
+fn callInFlight(r: *Server) !request.Id {
+    const l = try r.newLogical(.call, .call);
+    l.id = try r.newRequest(.normal);
+    return l.id.?;
+}
+
+test "a bad line that a call in flight could have written does not refuse the list that waits with it: its answer is only late" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    const call = try callInFlight(&r);
+    // The call's reply is a line with no readable id: stdio gives each request in flight a grace, and the line
+    // can be the list's as little as it can be the call's.
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expect(holdsGrace(&r, list));
+    try std.testing.expect(holdsGrace(&r, call));
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.logicalFor(call) == null);
+    try std.testing.expect(!r.catalog.refused);
+    try std.testing.expect(r.listRefusal() == null);
+}
+
+test "a later bad line, when the list is the one request left, is the list's own, though it began its grace with a call's line" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    const call = try callInFlight(&r);
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    // The call is answered; the list is the one request left, and the server writes another line fx cannot read.
+    try r.stepRequest(.{ .response_received = .{ .id = call, .response = .result } });
+    try r.onRefusedLine(error.InvalidJson, "still not json", null);
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "a list is still the one request a bad line can be about while a listen is open, because the listen gets no grace" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    try r.stepRequest(.{ .send = .listen });
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expect(holdsGrace(&r, list));
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
 }
 
 fn pageTestServer(r: *Server) !void {

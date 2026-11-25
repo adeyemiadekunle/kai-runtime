@@ -3,9 +3,10 @@
 // repeat one task, a reason line under a failed call, and a recap on the turn
 // summary.
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
+import { logLines, rootSessionIds, savedSessionIds } from "./saved-sessions";
 import {
   CHILD_MARKER,
   createStoryRoot,
@@ -20,10 +21,12 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 90_000;
@@ -105,7 +108,17 @@ const REFUSED_REQUESTS: StoryStep[] = [
 const REFUSED_LAST: StoryStep[] = [
   { at: 0, calls: [sh("printf done")] },
   { at: 1, calls: [REFUSED_REQUESTS[0].calls![0]] },
-  { at: 2, text: "I could not list the folder." },
+  // The reply's words show a second before its stream ends, so the row's
+  // reason, which shows at the turn's end, comes after them.
+  {
+    at: 2,
+    response: () => {
+      const held = heldFakeGatewayFinalText();
+      held.send("I could not list the folder.");
+      setTimeout(() => held.release(""), 1_000);
+      return held.response;
+    },
+  },
 ];
 
 // Two commands fail, the last of them too.
@@ -132,6 +145,24 @@ const NAMES_ONLY: StoryStep[] = [
   },
   { at: 2, text: "The notes are saved." },
 ];
+
+// Twelve commands one after the other, of nine different steps. The last one,
+// sh wait.sh, runs until the test lets it end.
+const TWELVE_COMMANDS: StoryStep[] = [
+  "ls desktop",
+  "cat desktop/src/main.ts",
+  "wc -l desktop/src/main.ts",
+  "grep -c export desktop/src/window.ts",
+  "ls desktop/src",
+  "sed -n 1p desktop/src/main.ts",
+  "head -1 desktop/src/window.ts",
+  "sh check.sh status",
+  "cat desktop/src/window.ts",
+  "tail -1 desktop/src/main.ts",
+  "sh check.sh remote",
+  "sh wait.sh",
+].map((command, at): StoryStep => ({ at, calls: [sh(command)] }));
+TWELVE_COMMANDS.push({ at: TWELVE_COMMANDS.length, text: "The desktop app has two source files." });
 
 // A command that nests `$( )` deeper than any stack, in a request the shell
 // refuses before it runs anything, so fx draws its row and nothing runs.
@@ -276,7 +307,9 @@ async function runStory(
   sessions.push(session);
   await session.waitForComposer();
   await session.sendText(options.prompt);
-  await session.waitForText(options.finalText, TIMEOUT);
+  // The reply's last words show before its turn ends, and the turn-end rows
+  // and the saved turn come after them.
+  await session.waitForPane((pane) => pane.includes(options.finalText) && turnSettled(pane), TIMEOUT);
   const pane = await session.waitForComposer(TIMEOUT);
   return { root, gateway, session, pane };
 }
@@ -300,17 +333,18 @@ function treeRows(block: string[]): string[] {
 test.skipIf(!tmuxAvailable())(
   "a failing build tells its story in the default view and after resume",
   async () => {
-    const { root, gateway, session, pane } = await runStory(FAILING_BUILD, {
+    const { root, gateway, session } = await runStory(FAILING_BUILD, {
       prompt: "the desktop build is broken, can you fix it?",
       finalText: "Fixed the build.",
     });
-    const lines = paneLines(pane);
+    // The turn's recap shows just after its last words.
+    const lines = paneLines(await session.waitForText(/^ {2}1 file changed \+1 -1 · ran 4 commands · /m, TIMEOUT));
 
     const checks = group(lines, "● Ran commands ✗");
-    // The two passing checks share a row by their step; the failure keeps
-    // its own, with the error's line after it.
+    // The two passing checks share a row by their step, which counts them;
+    // the failure keeps its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
-      "├ Ran sh check.sh",
+      "├ Ran sh check.sh · 2 calls",
       expect.stringMatching(/^└ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
@@ -343,6 +377,232 @@ test.skipIf(!tmuxAvailable())(
     const resumedLines = paneLines(await resumed.waitForComposer(TIMEOUT));
     expect(group(resumedLines, "● Ran commands ✗")).toEqual(checks);
     expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
+  },
+  TIMEOUT * 3,
+);
+
+/** Every saved session log under `home`. */
+function savedSessionLogs(home: string): string[] {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  return readdirSync(sessions).map((id) => join(sessions, id, "log.jsonl")).filter((log) => existsSync(log));
+}
+
+/** A file URL's path as fx writes one: each byte but [A-Za-z0-9/._~-] percent-encoded. */
+function fileUrlPath(path: string): string {
+  return [...Buffer.from(path)]
+    .map((byte) => /[A-Za-z0-9/._~-]/.test(String.fromCharCode(byte)) ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`)
+    .join("");
+}
+
+/**
+ * The file URL path of the last link fx wrote around `name`, read from the
+ * bytes it recorded to `tape`, or undefined when it wrote none. A running
+ * row can link a name to the path its call named before the call ends.
+ */
+function lastLinkTarget(tape: string, name: string): string | undefined {
+  const bytes = readFileSync(tape).toString("latin1");
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // The name, then any style resets, then the link's close.
+  const link = new RegExp(`\\x1b\\]8;;file://([^\\x1b]*)\\x1b\\\\${escaped}(?:\\x1b\\[[0-9;]*m)*\\x1b\\]8;;\\x1b\\\\`, "g");
+  return [...bytes.matchAll(link)].at(-1)?.[1];
+}
+
+async function resumeStory(
+  root: StoryRoot,
+  gateway: { baseUrl: string; chatUrl: string },
+  finalText: string,
+  tape?: string,
+  options: { ready?: RegExp; cwd?: string; target?: string } = {},
+) {
+  const env = tape ? { ...storyEnv(root, gateway), FX_RECORD: tape } : storyEnv(root, gateway);
+  const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${options.target ?? "last"}`, cwd: options.cwd ?? root.workspace, env, width: 110, height: 60 });
+  sessions.push(resumed);
+  await resumed.waitForText(finalText, TIMEOUT);
+  await resumed.waitForComposer(TIMEOUT);
+  // The turn's recap shows once its history has replayed.
+  return { resumed, lines: paneLines(await resumed.waitForText(options.ready ?? /^ {2}\d+ files? changed /m, TIMEOUT)) };
+}
+
+/** Whether fx's recorded bytes link any file whose URL path ends in `name`. */
+function linksTo(tape: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\x1b\\]8;;file://[^\\x1b]*/${escaped}\\x1b\\\\`).test(readFileSync(tape).toString("latin1"));
+}
+
+test.skipIf(!tmuxAvailable())(
+  "edits of one file named in several ways share one row, and file names link to their files, also after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const main = join(root.workspace, "desktop", "src", "main.ts");
+    // A folder outside the workspace and a symlink to it, as /tmp is to
+    // /private/tmp on macOS.
+    mkdirSync(join(root.root, "real"));
+    writeFileSync(join(root.root, "real", "notes.md"), "a\nb\n");
+    symlinkSync(join(root.root, "real"), join(root.root, "link"));
+    const notes = realpathSync(join(root.root, "real", "notes.md"));
+    const edit = (path: string, from: string, to: string) => ({ name: "edit_file", input: { path, old_string: from, new_string: to } });
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will tidy main.ts.", calls: [edit("desktop/src/main.ts", "const url", "const appUrl")] },
+      { at: 1, calls: [edit("./desktop/src/main.ts", "createTray()", "createTray({})")] },
+      { at: 2, calls: [edit(main, "return win;", "return win ?? null;")] },
+      { at: 3, calls: [edit(join(root.root, "link", "notes.md"), "a", "A")] },
+      { at: 4, calls: [edit(notes, "b", "B")] },
+      { at: 5, calls: [{ name: "read_file", input: { path: "desktop/src/window.ts" } }] },
+      { at: 6, text: "Tidied main.ts." },
+    ];
+    const gateway = startStoryGateway(steps);
+    gateways.push(gateway);
+    const tape = join(root.root, "live.fxtape");
+    const session = await TmuxSession.create({ cwd: root.workspace, env: { ...storyEnv(root, gateway), FX_RECORD: tape }, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("tidy main.ts");
+    await session.waitForText("Tidied main.ts.", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const lines = paneLines(await session.waitForText(/^ {2}2 files changed /m, TIMEOUT));
+
+    // Each file's ways of naming it are one file: one row and one count.
+    const story = group(lines, /^● Edited /);
+    expect(treeRows(story)).toEqual(["├ Edited main.ts +3/-3 · 3 edits", "├ Edited notes.md +2/-2 · 2 edits", "└ Read window.ts"]);
+    expect(lines.some((line) => /^ {2}2 files changed \+5 -5 · /.test(line))).toBe(true);
+    // Each name links to its file, so Cmd+click opens it: a relative path in
+    // the workspace, and a symlinked one where it resolves.
+    const targets = { "main.ts": fileUrlPath(realpathSync(main)), "notes.md": fileUrlPath(notes), "window.ts": fileUrlPath(realpathSync(join(root.workspace, "desktop", "src", "window.ts"))) };
+    for (const [name, target] of Object.entries(targets)) expect(lastLinkTarget(tape, name)).toBe(target);
+    // What the model gets and what the session saves stay as they were.
+    for (const request of gateway.requests) expect(request.body).not.toContain("resolved_path");
+    expect(gateway.requests.at(-1)!.body).toContain("edited desktop/src/main.ts (");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Tidied main.ts.", resumedTape);
+    expect(group(resumedLines, /^● Edited /)).toEqual(story);
+    for (const [name, target] of Object.entries(targets)) expect(lastLinkTarget(resumedTape, name)).toBe(target);
+    for (const log of savedSessionLogs(root.home)) expect(readFileSync(log, "utf8")).not.toContain("resolved_path");
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a read through a symlink links to the file it read, and to nothing a click could run, also after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    // A repository can ship these: a note that is a script, a note that
+    // points to another note, and one that points nowhere.
+    writeFileSync(join(root.workspace, "run.command"), "#!/bin/sh\necho ran\n", { mode: 0o755 });
+    symlinkSync("run.command", join(root.workspace, "notes.md"));
+    mkdirSync(join(root.workspace, "real"));
+    writeFileSync(join(root.workspace, "real", "real.md"), "# real\n");
+    symlinkSync("real/real.md", join(root.workspace, "link.md"));
+    symlinkSync("missing.md", join(root.workspace, "gone.md"));
+    const read = (path: string) => ({ name: "read_file", input: { path } });
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will read the notes.", calls: [read("notes.md")] },
+      { at: 1, calls: [read("link.md")] },
+      { at: 2, calls: [read("gone.md")] },
+      { at: 3, text: "Read the notes." },
+    ];
+    const gateway = startStoryGateway(steps);
+    gateways.push(gateway);
+    const tape = join(root.root, "live.fxtape");
+    const session = await TmuxSession.create({ cwd: root.workspace, env: { ...storyEnv(root, gateway), FX_RECORD: tape }, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("read the notes");
+    await session.waitForText("Read the notes.", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const ready = /^ {2}Explored /m;
+    const lines = paneLines(await session.waitForText(ready, TIMEOUT));
+    const story = group(lines, /^● /);
+    expect(story.join("\n")).toContain("notes.md");
+    expect(story.join("\n")).toContain("gone.md");
+
+    // link.md links to the note it points to; notes.md, whose file would
+    // run, and gone.md, which names no file, link to nothing.
+    const real = fileUrlPath(realpathSync(join(root.workspace, "real", "real.md")));
+    const expectLinks = (recorded: string) => {
+      expect(lastLinkTarget(recorded, "link.md")).toBe(real);
+      expect(lastLinkTarget(recorded, "notes.md")).toBeUndefined();
+      expect(lastLinkTarget(recorded, "gone.md")).toBeUndefined();
+      for (const name of ["notes.md", "link.md", "gone.md", "run.command", "missing.md"]) expect(linksTo(recorded, name)).toBe(false);
+    };
+    expectLinks(tape);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Read the notes.", resumedTape, { ready });
+    expect(group(resumedLines, /^● /)).toEqual(story);
+    expectLinks(resumedTape);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a session resumed in another folder links no saved path, which could name another file there",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    mkdirSync(join(root.workspace, "real"));
+    writeFileSync(join(root.workspace, "real", "real.md"), "# real\n");
+    symlinkSync("real/real.md", join(root.workspace, "link.md"));
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will read the note.", calls: [{ name: "read_file", input: { path: "link.md" } }] },
+      { at: 1, text: "Read the note." },
+    ];
+    const gateway = startStoryGateway(steps);
+    gateways.push(gateway);
+    const tape = join(root.root, "live.fxtape");
+    const session = await TmuxSession.create({ cwd: root.workspace, env: { ...storyEnv(root, gateway), FX_RECORD: tape }, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("read the note");
+    await session.waitForText("Read the note.", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const ready = /^ {2}Explored /m;
+    const lines = paneLines(await session.waitForText(ready, TIMEOUT));
+    expect(lastLinkTarget(tape, "link.md")).toBe(fileUrlPath(realpathSync(join(root.workspace, "real", "real.md"))));
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+
+    // In this folder, the same relative path is a symlink to a script.
+    const other = join(root.root, "other");
+    mkdirSync(join(other, "real"), { recursive: true });
+    writeFileSync(join(other, "run.command"), "#!/bin/sh\necho ran\n", { mode: 0o755 });
+    symlinkSync("../run.command", join(other, "real", "real.md"));
+    const [id] = rootSessionIds(root.home);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Read the note.", resumedTape, { ready, cwd: other, target: id });
+    expect(group(resumedLines, /^● /)).toEqual(group(lines, /^● /));
+    expect(lastLinkTarget(resumedTape, "link.md")).toBeUndefined();
+    expect(linksTo(resumedTape, "real.md")).toBe(false);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "edits run through toolbox keep their counts after resume",
+  async () => {
+    const run = (from: string, to: string) => ({ name: "toolbox", input: { run: "edit_file", arguments: { path: "desktop/src/main.ts", old_string: from, new_string: to } } });
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will tidy main.ts through toolbox.", calls: [run("const url", "const appUrl")] },
+      { at: 1, calls: [run("return win;", "return win ?? null;")] },
+      { at: 2, text: "Tidied main.ts." },
+    ];
+    const { root, gateway, session } = await runStory(steps, { prompt: "tidy main.ts", finalText: "Tidied main.ts." });
+    const lines = paneLines(await session.waitForText(/^ {2}1 file changed /m, TIMEOUT));
+    const row = lines.find((line) => line.startsWith("● Edited main.ts"));
+    expect(row).toBe("● Edited main.ts +2/-2 · 2 edits");
+    expect(lines.some((line) => /^ {2}1 file changed \+2 -2 · /.test(line))).toBe(true);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Tidied main.ts.");
+    expect(resumedLines.find((line) => line.startsWith("● Edited main.ts"))).toBe(row);
+    expect(resumedLines.some((line) => /^ {2}1 file changed \+2 -2 · /.test(line))).toBe(true);
   },
   TIMEOUT * 3,
 );
@@ -386,7 +646,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("Edit the readme.");
-    await session.waitForText("STORY_BAD_REQUEST", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("STORY_BAD_REQUEST") && turnSettled(pane), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Read it again.");
     await session.waitForText("The readme says hello.", TIMEOUT);
@@ -579,6 +839,55 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a row of several commands counts its calls while it runs, once it ran, at a narrow width, and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    writeFileSync(join(root.workspace, "wait.sh"), "while [ ! -f released ]; do sleep 0.1; done\n");
+    const gateway = startStoryGateway(TWELVE_COMMANDS);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("look around the desktop app");
+
+    // The row names each of its nine steps once, where it last ran, so only
+    // its count says it holds twelve calls, and the count stays as the row
+    // goes from running to ran.
+    const running = "● Running +6, tail, sh check.sh, sh wait.sh · 12 calls";
+    expect(paneLines(await session.waitForText(running, TIMEOUT))).toContain(running);
+    writeFileSync(join(root.workspace, "released"), "");
+    await session.waitForPane((pane) => pane.includes("The desktop app has two source files.") && turnSettled(pane), TIMEOUT);
+    const ran = "● Ran +6, tail, sh check.sh, sh wait.sh · 12 calls ✓";
+    const expectRow = (pane: string, row: string) => {
+      expect(paneLines(pane).filter((line) => line.includes(" calls"))).toEqual([row]);
+    };
+    expectRow(await session.waitForComposer(TIMEOUT), ran);
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+
+    // After resume the row reads the same. A narrow terminal counts more of
+    // its older steps in front, and keeps its newest step and its count.
+    const resumedRows: Array<[number, string]> = [[110, ran], [40, "● Ran +8, sh wait.sh · 12 calls ✓"]];
+    for (const [width, row] of resumedRows) {
+      const resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: root.workspace,
+        env: storyEnv(root, gateway),
+        width,
+        height: 60,
+      });
+      sessions.push(resumed);
+      await resumed.waitForText("The desktop app has two source files.", TIMEOUT);
+      expectRow(await resumed.waitForComposer(TIMEOUT), row);
+      await resumed.kill();
+      sessions.splice(sessions.indexOf(resumed), 1);
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "a command nested without end gets a row that names its program, also after resume",
   async () => {
     const { root, gateway, session, pane } = await runStory(NESTED_WITHOUT_END, {
@@ -691,7 +1000,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("save the notes in a session");
     // While the wait runs, its row names the same programs.
     await session.waitForText("Waiting for cat, sleep, printf", TIMEOUT);
-    await session.waitForText("The session saved the notes.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The session saved the notes.") && turnSettled(pane), TIMEOUT);
     const expectNames = (lines: string[]) => {
       // The session's row names the programs of its launch command, and says
       // it ran once the check found the command ended; the document's text
@@ -750,7 +1059,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("write the files");
-    await session.waitForText("The files are written.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The files are written.") && turnSettled(pane), TIMEOUT);
     const expectNames = (lines: string[]) => {
       // Each row names its file, and two files with one name stay two rows.
       expect(treeRows(group(lines, /^● Wrote files/))).toEqual([
@@ -930,7 +1239,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("ask the reviewer");
     await session.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), TIMEOUT);
     sendRead!();
-    await session.waitForText("The reviewer is done.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The reviewer is done.") && turnSettled(pane), TIMEOUT);
 
     const expectOwnLine = (lines: string[]) => {
       // Main's calls share a group; the report is a line of its own after
@@ -1171,7 +1480,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("LAND_IT");
-    await session.waitForText("LANDED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
     const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
     // One line for the waits and the messages they took; the report keeps
     // a line of its own.
@@ -1189,6 +1498,243 @@ test.skipIf(!tmuxAvailable())(
     for (const note of notes) expect(details).toContain(note);
     await session.sendKeys("C-o");
 
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("LANDED", TIMEOUT);
+    expect(paneLines(await resumed.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line))).toEqual(live);
+  },
+  TIMEOUT * 3,
+);
+
+const LANDER_NOTES = ["On the model checks.", "Fixes pushed."];
+
+/**
+ * Sends `prompt`, and main makes `calls`, one for each step, with no text
+ * between them, while lander sends both notes and then its report, each
+ * during one of main's three waits. Returns main's tool lines live and after
+ * resume, and what Ctrl+O showed live.
+ */
+async function landerWaitStory(prompt: string, calls: Array<() => Response>) {
+  const root = createStoryRoot();
+  roots.push(root);
+  const trace = join(root.root, "trace.log");
+  const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+  let session: TmuxSession | undefined;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    const request = storyPrompt(body);
+    if (body.includes("You are the subagent")) {
+      const sent = toolResultsAfter(request, CHILD_MARKER);
+      // Each message, and the report, goes while main waits for it.
+      await session!.waitForPane(() => waitsBegun() > sent, TIMEOUT);
+      if (sent < LANDER_NOTES.length) {
+        return fakeGatewayToolCall(`lander_note_${sent}`, "subagent", { request: { action: "message", agent: "parent", message: LANDER_NOTES[sent] } });
+      }
+      return fakeGatewayFinalText("Landed block B.");
+    }
+    return calls[toolResultsAfter(request, prompt)]?.() ?? fakeGatewayFinalText("LANDED");
+  });
+  gateways.push(gateway);
+  const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox" };
+  session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+  sessions.push(session);
+  await session.waitForComposer();
+  await session.sendText(prompt);
+  await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+  const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+  expect(waitsBegun()).toBe(3);
+
+  await session.sendKeys("C-o");
+  await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+  let fullTranscript = await session.capturePane();
+  for (let page = 0; page < 12 && !LANDER_NOTES.every((note) => fullTranscript.includes(note)); page += 1) {
+    await session.sendKeys("PPage");
+    fullTranscript += await session.capturePane();
+  }
+  await session.sendKeys("C-o");
+
+  await session.kill();
+  sessions.splice(sessions.indexOf(session), 1);
+  const resumedSession = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+  sessions.push(resumedSession);
+  await resumedSession.waitForText("LANDED", TIMEOUT);
+  const resumed = paneLines(await resumedSession.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+  return { live, resumed, fullTranscript };
+}
+
+const startLander = () => fakeGatewayToolCall("land", "subagent", { action: "message", agent: "lander", message: `${CHILD_MARKER} Land block B.` });
+const bareWait = (id: string) => () => fakeGatewayToolCall(id, "subagent", { action: "wait" });
+const waitForLander = () => fakeGatewayToolCall("wait_lander", "subagent", { action: "wait", agent: "lander" });
+
+test.skipIf(!tmuxAvailable())(
+  "a named wait between bare waits keeps the group it has live after resume, with the messages that came between them",
+  async () => {
+    const checkStatus = (id: string) => () => fakeGatewayToolCall(id, "shell", { action: "run", command: "sh check.sh status" });
+    const { live, resumed } = await landerWaitStory("MIXED_WAITS", [checkStatus("check_0"), checkStatus("check_1"), startLander, bareWait("wait_3"), waitForLander, bareWait("wait_5")]);
+    // The calls share one group, the start and the named wait share
+    // lander's row, and the bare waits take both messages.
+    expect(live).toEqual([
+      "● Ran commands, waited for a subagent ✓",
+      "├ Ran sh check.sh status ×2",
+      "├ Waited for lander",
+      "└ Waited for lander · 2 messages",
+      "● lander finished",
+    ]);
+    expect(resumed).toEqual(live);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "the last wait's row counts the message a named wait before it took, live and after resume",
+  async () => {
+    const { live, resumed, fullTranscript } = await landerWaitStory("NAMED_THEN_BARE", [startLander, waitForLander, bareWait("wait_2"), bareWait("wait_3")]);
+    // No message keeps a line of its own; the report does.
+    expect(live).toEqual([
+      "● Waited for a subagent",
+      "├ Waited for lander",
+      "└ Waited for lander · 2 messages",
+      "● lander finished",
+    ]);
+    expect(resumed).toEqual(live);
+    // Ctrl+O still shows each message.
+    for (const note of LANDER_NOTES) expect(fullTranscript).toContain(note);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a wait the user stopped reads as stopping the wait, never as cancelling the subagent, live and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const trace = join(root.root, "trace.log");
+    const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+    let session: TmuxSession | undefined;
+    let releaseReport = () => {};
+    const reportHeld = new Promise<void>((release) => (releaseReport = release));
+    let stopped = false;
+    const calls = [startLander, bareWait("wait_1"), bareWait("wait_2")];
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const request = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        // One message during the first wait, and the report once the user
+        // stopped the second.
+        if (toolResultsAfter(request, CHILD_MARKER) === 0) {
+          await session!.waitForPane(() => waitsBegun() >= 1, TIMEOUT);
+          return fakeGatewayToolCall("lander_note_0", "subagent", { request: { action: "message", agent: "parent", message: LANDER_NOTES[0] } });
+        }
+        await reportHeld;
+        return fakeGatewayFinalText("Landed block B.");
+      }
+      if (stopped) return fakeGatewayFinalText("LANDED");
+      return calls[toolResultsAfter(request, "STOPPED_WAIT")]?.() ?? fakeGatewayFinalText("LANDED");
+    });
+    gateways.push(gateway);
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox,interrupt" };
+    const toolLines = (pane: string) => paneLines(pane).filter((line) => /^(●|├|└|▪) /.test(line));
+    const fullTranscriptOf = async (active: TmuxSession) => {
+      await active.sendKeys("C-o");
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+      let text = await active.capturePane();
+      for (let page = 0; page < 12 && !text.includes("Cancelled lander"); page += 1) {
+        await active.sendKeys("PPage");
+        text += await active.capturePane();
+      }
+      await active.sendKeys("C-o");
+      return text;
+    };
+    session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("STOPPED_WAIT");
+    await session.waitForPane(() => waitsBegun() >= 2, TIMEOUT);
+    await session.waitForText("Waiting for lander", TIMEOUT);
+    stopped = true;
+    await session.sendInterruptEscapePair(TIMEOUT);
+    await session.waitForPane(() => readFileSync(trace, "utf8").includes("event=interrupt_persisted"), TIMEOUT);
+    releaseReport();
+    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+    const live = toolLines(await session.waitForComposer(TIMEOUT));
+    const liveTranscript = await fullTranscriptOf(session);
+
+    // The row says main stopped waiting, and counts the message the wait
+    // took; the notice under it names no subagent.
+    expect(live).toEqual([
+      "● Started a subagent · 1 cancelled",
+      "├ Started lander",
+      "└ Stopped waiting for lander · 1 message",
+      "▪ Cancelled · What can fx do differently?",
+      "● lander finished",
+    ]);
+    // Ctrl+O keeps core's words.
+    expect(liveTranscript).toContain("Cancelled lander");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    // The turn saved whom the wait waited for, in an item of its own (D102).
+    const items = savedSessionIds(root.home)
+      .flatMap((id) => logLines(root.home, id))
+      .filter((line: any) => line.kind === "item" && line.type === "cancelled_wait");
+    expect(items.map((line: any) => line.data)).toEqual([{ call_id: "wait_2", subagents: "lander" }]);
+
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("LANDED", TIMEOUT);
+    expect(toolLines(await resumed.waitForComposer(TIMEOUT))).toEqual(live);
+    expect(await fullTranscriptOf(resumed)).toContain("Cancelled lander");
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a message counts only on the wait row that waits for its sender, live and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const trace = join(root.root, "trace.log");
+    const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+    let session: TmuxSession | undefined;
+    // Lander sends a message during the first wait and reports during the
+    // third; scout sends one during the second and reports during the fourth.
+    const childSteps: Record<string, Array<{ afterWaits: number; message?: string; report?: string }>> = {
+      LANDER_JOB: [{ afterWaits: 1, message: "Lander one." }, { afterWaits: 3, report: "Landed." }],
+      SCOUT_JOB: [{ afterWaits: 2, message: "Scout one." }, { afterWaits: 4, report: "Mapped." }],
+    };
+    const calls = [
+      () => fakeGatewayToolCall("start_lander", "subagent", { action: "message", agent: "lander", message: "LANDER_JOB Land block B." }),
+      () => fakeGatewayToolCall("start_scout", "subagent", { action: "message", agent: "scout", message: "SCOUT_JOB Map the tray." }),
+      bareWait("wait_2"),
+      bareWait("wait_3"),
+      bareWait("wait_4"),
+      bareWait("wait_5"),
+    ];
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const request = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        const marker = Object.keys(childSteps).find((key) => body.includes(key))!;
+        const step = childSteps[marker][toolResultsAfter(request, marker)];
+        await session!.waitForPane(() => waitsBegun() >= step.afterWaits, TIMEOUT);
+        if (step.message) {
+          return fakeGatewayToolCall(`${marker}_note`, "subagent", { request: { action: "message", agent: "parent", message: step.message } });
+        }
+        return fakeGatewayFinalText(step.report!);
+      }
+      return calls[toolResultsAfter(request, "TWO_AGENTS")]?.() ?? fakeGatewayFinalText("LANDED");
+    });
+    gateways.push(gateway);
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox" };
+    session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("TWO_AGENTS");
+    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
+    const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+    // The last wait's row waits for scout only, so it counts scout's
+    // message, and lander's keeps its own line.
+    expect(live).toContain("└ Waited for scout · 1 message");
+    expect(live).toContain("● Message from lander");
     await session.kill();
     sessions.splice(sessions.indexOf(session), 1);
     const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
@@ -1362,3 +1908,70 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 2,
 );
+
+/** Sixty numbered lines; each edit below swaps seven of them for one, `+1/-7`. */
+const G_TSE = Array.from({ length: 60 }, (_, i) => `g line ${i}`).join("\n") + "\n";
+const TOOL_CALLS_FINISH = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+const gEdit = (id: string, start: number) => ({
+  type: "tool-call",
+  toolCallId: id,
+  toolName: "edit_file",
+  input: { path: "g.tse", old_string: Array.from({ length: 7 }, (_, i) => `g line ${start + i}`).join("\n"), new_string: `g joined ${start}` },
+});
+
+/** The tool call and tool result ids in a Gateway request's prompt, in order. */
+function promptCallIds(body: string): { calls: string[]; results: string[] } {
+  const parts = JSON.parse(body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+  const ids = (type: string) => parts.filter((part: { type: string }) => part.type === type).map((part: { toolCallId: string }) => part.toolCallId);
+  return { calls: ids("tool-call"), results: ids("tool-result") };
+}
+
+// Three edits of one file whose replies reuse one call id across replies (F),
+// repeat it in one reply (G), or leave it empty (H), and the ids fx keeps.
+const CALL_ID_CASES: Array<[string, object[][], string[]]> = [
+  ["one id in every reply", [[gEdit("dup", 1)], [gEdit("dup", 10)], [gEdit("dup", 20)]], ["dup", "fx_call_1", "fx_call_2"]],
+  ["one id three times in one reply", [[gEdit("same", 1), gEdit("same", 10), gEdit("same", 20)]], ["same", "fx_call_1", "fx_call_2"]],
+  ["empty ids", [[gEdit("", 1), gEdit("", 10), gEdit("", 20)]], ["fx_call_1", "fx_call_2", "fx_call_3"]],
+];
+
+for (const [label, replies, ids] of CALL_ID_CASES) {
+  test.skipIf(!tmuxAvailable())(
+    `edits whose calls have ${label} each run and count, live and after resume`,
+    async () => {
+      const root = createStoryRoot();
+      roots.push(root);
+      writeFileSync(join(root.workspace, "g.tse"), G_TSE);
+      const finalText = "Joined three blocks of g.tse.";
+      const gateway = startFakeGateway([
+        ...replies.map((calls, index) => fakeGatewaySse([
+          ...(index === 0 ? [{ type: "text-delta", id: "text_edit", delta: "Joining three blocks." }] : []),
+          ...calls,
+          TOOL_CALLS_FINISH,
+        ])),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+      sessions.push(session);
+      await session.waitForComposer();
+      await session.sendText("Join three blocks of g.tse.");
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const live = paneLines(await session.waitForText(/^ {2}1 file changed /m, TIMEOUT));
+
+      expect(readFileSync(join(root.workspace, "g.tse"), "utf8").match(/g joined/g)).toHaveLength(3);
+      expect(live.join("\n")).not.toContain("malformed");
+      expect(live).toContain("● Edited g.tse +3/-21 · 3 edits");
+      expect(live.find((line) => line.startsWith("  1 file changed"))).toStartWith("  1 file changed +3 -21");
+      // The model gets each call back under the id fx keeps, with its result.
+      expect(promptCallIds(gateway.requests.at(-1)!.body)).toEqual({ calls: ids, results: ids });
+
+      await session.kill();
+      sessions.splice(sessions.indexOf(session), 1);
+      const { lines } = await resumeStory(root, gateway, finalText);
+      expect(lines).toContain("● Edited g.tse +3/-21 · 3 edits");
+      expect(lines.find((line) => line.startsWith("  1 file changed"))).toStartWith("  1 file changed +3 -21");
+    },
+    TIMEOUT,
+  );
+}
