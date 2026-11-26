@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -248,6 +248,15 @@ describe("fx mcp", () => {
     ["`tools` is written twice, once with an escape", '"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}', "a field is written twice"],
     ["the server answers with an error", '"error":{"code":-32603,"message":"Internal error"}', "the server answered the list with an error"],
     ["the answer is no finished list", '"result":{"resultType":"input_required","inputRequests":{}}', "the server's answer was not a finished list"],
+    // The reply is matched to the list by its id, which comes first, and then fx cannot read the rest. It says so, not that the server
+    // answered with an error, and it does not wait 30 seconds for the list.
+    ["the reply goes wrong after its id: not JSON", '"result":{"resultType":"complete","tools":[]},"extra":nope', "the answer is not a readable tool list"],
+    [
+      "the reply goes wrong after its id: nested past the engine's limit",
+      `"result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)}`,
+      "the answer is not a readable tool list",
+    ],
+    ["the reply goes wrong after its id: `result` is written twice", '"result":{"resultType":"complete","tools":[]},"result":{"resultType":"complete","tools":[]}', "a field is written twice"],
   ];
 
   for (const [what, reply, why] of refusedLists) {
@@ -266,6 +275,33 @@ describe("fx mcp", () => {
       // `error` is what says a server is down, and this one is not; `status` and `tools` keep their meaning.
       expect(shown).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: why, tools: [] });
     }, 30_000);
+  }
+
+  // The reply's id comes after what fx cannot read, so the line names no request. Nothing tells which list it answers: the
+  // list waits out the 30-second grace, as every request in flight does, and then fx says it could not read the list.
+  const unnamedLists: [string, string, "text" | "json"][] = [
+    ["not JSON before the id", '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}', "text"],
+    ["nested past the engine's limit before the id", `{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)},"id":{id}}`, "json"],
+  ];
+  const UNREADABLE = "the answer is not a readable tool list";
+
+  for (const [what, line, form] of unnamedLists) {
+    test(`show says the list was unreadable when no id could be read, after the grace: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_LINE: line } }) } });
+      const started = Date.now();
+      const shown = await runFx(["mcp", "show", "fixture", ...(form === "json" ? ["--json"] : [])], { cwd: root.workspace, env: root.env, timeoutMs: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(shown.stderr).toBe("");
+      expect(shown.code).toBe(0);
+      if (form === "json") {
+        expect(JSON.parse(shown.stdout)).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: UNREADABLE, tools: [] });
+      } else {
+        expect(shown.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${UNREADABLE}\n`);
+        expect(shown.stdout).not.toContain("0 tools");
+      }
+      // The wait is the grace: not at once, as a line with an id would, and far short of the 5 minutes an operation waits.
+      expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    }, 90_000);
   }
 
   test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
@@ -383,16 +419,14 @@ describe("fx mcp", () => {
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
 
-    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    // `--global` names ~/.fx/mcp.json.
     const global = await mcp(root, "remove", "--global", "twin");
     expect(global.code).toBe(0);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
     const profile = await mcp(root, "remove", "--profile", "twin");
-    expect(profile.code).toBe(1);
-    // The older --profile still names the profile file, with a warning.
-    expect(profile.stderr).toBe(
-      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
-    );
+    expect(profile.code).toBe(2);
+    expect(profile.stdout).toBe("");
+    expect(profile.stderr).toBe("fx mcp remove: --profile was removed; use --global\nusage: fx mcp remove [--global | --project] NAME\n");
   });
 
   test("approve and reject say exactly what they trust", async () => {
@@ -736,7 +770,7 @@ describe("/mcp in the shell", () => {
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
     // The next prompt loads it first, so its own request tells the model.
     await tui.sendText("first prompt");
-    await tui.waitForText("first done", 15_000);
+    await tui.waitForPane((pane) => pane.includes("first done") && turnSettled(pane), 15_000);
     expect(gateway.requests).toHaveLength(1);
     const firstMenu = menu(gateway.requests[0]!.body);
     expect(firstMenu).toContain("- fixture");
@@ -865,7 +899,7 @@ describe("/mcp in the shell", () => {
         await Bun.sleep(50);
       }
       held.release("first done");
-      await tui.waitForText("second done", 15_000);
+      await tui.waitForPane((pane) => pane.includes("second done") && turnSettled(pane), 15_000);
       // The next prompt, sent with no turn running, loads the change.
       await tui.sendText("third prompt");
       await tui.waitForText("third done", 15_000);
@@ -1574,6 +1608,62 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     // The shell still answers.
     await tui.sendText("/mcp list");
     await tui.waitForText("~/.fx/mcp.json", 10_000);
+    await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
+    await tui.waitForText("Added web to .mcp.json.", 10_000);
+  }, 90_000);
+
+  // A file nested past the limit (src/core/shared/json_depth.zig) is not rewritten: the writer aborts the whole
+  // process from 257 levels. The reader still loads such a file.
+  const nested = (levels: number, server = "old") => `{"mcpServers":{"${server}":{"command":"true"}},"notes":${"[".repeat(levels)}${"]".repeat(levels)}}`;
+  const TOO_DEEP = "the file is nested more than 64 levels deep; flatten it by hand first";
+
+  test("add and remove refuse a file nested past the limit, however deep, and leave it as it was", async () => {
+    for (const levels of [64, 256, 300, 400_000]) {
+      const root = fresh(nested(levels));
+      writeFileSync(root.projectPath, nested(levels, "proj"));
+      for (const [flag, file, path, server] of [["--global", "~/.fx/mcp.json", root.profilePath, "old"], ["--project", ".mcp.json", root.projectPath, "proj"]] as const) {
+        await refused(root, ["--no-login", flag, "web", "https://mcp.example/mcp"], TOO_DEEP, file, "add", "web", path);
+        await refused(root, [flag, server], TOO_DEEP, file, "remove", server, path);
+      }
+      expect((await loaded(root)).sort()).toEqual(["old", "proj"]);
+    }
+  }, 120_000);
+
+  test("guard: a file at the limit is edited, and a deep file beside the one being edited does not stop it", async () => {
+    const root = fresh(nested(63));
+    const added = await mcp(root, "add", "--no-login", "web", "https://mcp.example/mcp");
+    expect(added.stderr).toBe("");
+    expect(added.stdout).toBe("Added web to ~/.fx/mcp.json.\n");
+    expect(Object.keys(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers)).toEqual(["old", "web"]);
+    const removed = await mcp(root, "remove", "--global", "old");
+    expect(removed.stdout).toBe("Removed old from ~/.fx/mcp.json.\n");
+
+    writeFileSync(root.profilePath, nested(400_000));
+    const profile = bytesOf(root.profilePath);
+    const project = await mcp(root, "add", "--no-login", "--project", "web", "https://mcp.example/mcp");
+    expect(project.stderr).toBe("");
+    expect(project.code).toBe(0);
+    expect(project.stdout).toStartWith("Added web to .mcp.json.\n");
+    expect(bytesOf(root.profilePath)).toBe(profile);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add and /mcp remove refuse a file nested past the limit and the shell keeps running", async () => {
+    const root = fresh(nested(300));
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 220,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const before = readFileSync(root.profilePath, "utf8");
+    await tui.sendText("/mcp add web https://x.example/mcp");
+    await tui.waitForText(`Couldn't add web to ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    await tui.sendText("/mcp remove old");
+    await tui.waitForText(`Couldn't remove old from ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
     await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
     await tui.waitForText("Added web to .mcp.json.", 10_000);
   }, 90_000);

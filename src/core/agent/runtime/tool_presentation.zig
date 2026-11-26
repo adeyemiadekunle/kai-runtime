@@ -17,6 +17,7 @@ const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const tool_result_display = @import("../../tooling/tool_result_display.zig");
 const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
     @import("../../tooling/command_result_mapping.zig")
@@ -58,6 +59,16 @@ pub fn providerToolOnlyReads(
     if (isProviderSearchAlias(tool_name)) return true;
     const spec = registry.lookup(tool_name) orelse return false;
     return spec.provider_executed and spec.activity_kind == .read;
+}
+
+/// `arguments_json` when it is one complete JSON object. A streaming call's
+/// arguments are that only once the provider has sent all of them, since no
+/// valid text can follow a complete object. Null otherwise.
+fn wholeArguments(scratch: Allocator, arguments_json: ?[]const u8) Allocator.Error!?[]const u8 {
+    const json = arguments_json orelse return null;
+    const start = std.mem.trimStart(u8, json, " \t\r\n");
+    if (start.len == 0 or start[0] != '{') return null;
+    return if (try std.json.validate(scratch, json)) json else null;
 }
 
 fn fallbackToolDisplay(
@@ -232,6 +243,7 @@ pub const ProvisionalToolStatuses = struct {
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = shown_tool_name,
                 .activity_kind = observed_kind,
+                .arguments_json = try wholeArguments(scratch.allocator(), arguments_json),
             },
         }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
@@ -765,6 +777,9 @@ pub const ToolPresentationGroupObservation = struct {
     has_visible_text: bool,
     saw_tool_start: bool,
     saw_visible_text_after_tool_start: bool,
+    /// The step called `ask_user_question`. Its answered question draws
+    /// below the open group, so calls after the answer start a new group.
+    asked_question: bool,
 };
 
 pub const ToolPresentationGroupTransition = struct {
@@ -805,7 +820,8 @@ pub fn transitionPresentationGroup(
     if (observation.has_visible_tool_calls) {
         next_active_group_id = resolved_tool_group_id;
     }
-    if (observation.saw_visible_text_after_tool_start or
+    if (observation.asked_question or
+        observation.saw_visible_text_after_tool_start or
         (observation.has_visible_text and !observation.has_visible_tool_calls))
     {
         next_active_group_id = null;
@@ -1501,8 +1517,39 @@ pub fn finishExecutedToolStatus(
             .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
             .check_found_command_ended = shell_command and try checkFoundCommandEnded(arena, call, result.model_output),
+            .resolved_path = readFileResolvedPath(call, result.status == .success, safe_result),
         },
     });
+}
+
+/// The file a completed read_file call read, as core resolved it with
+/// symlinks followed: the path its result names (`readPathOfResult`), in
+/// the text the session saves, so a resumed row finds the same path. Null
+/// for any other call, and for one that failed, whose path core never
+/// resolved to a file.
+fn readFileResolvedPath(call: ToolCall, succeeded: bool, saved_result: []const u8) ?[]const u8 {
+    if (!succeeded or !std.mem.eql(u8, call.name, "read_file")) return null;
+    return tool_result_display.readPathOfResult(saved_result);
+}
+
+test "a finished read tells the transcript the file core read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    // The call named a symlink; core read the file it points to.
+    const call = ToolCall{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const output = "<path>real/real.md</path>\n<content>\n1\tok\n</content>";
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expectEqualStrings("real/real.md", capture.events.items[0].terminal.resolved_path.?);
+    // A failed read, and a call of another tool, resolved no file.
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{ .status = .failure, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expect(capture.events.items[1].terminal.resolved_path == null);
+    const search = ToolCall{ .id = "search", .name = "grep_files", .arguments_json = "{\"pattern\":\"a\"}" };
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, search, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expect(capture.events.items[2].terminal.resolved_path == null);
 }
 
 fn presentedToolResult(
@@ -1813,7 +1860,15 @@ fn failureStatusDetail(
     // An MCP call shows why it failed, made directly or through toolbox.
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
-    if (safe_result.len == 0 or !mcp_call) return null;
+    if (!mcp_call) return null;
+    return mcpFailureCause(arena, safe_result);
+}
+
+/// Why an MCP call failed, from the result the model got, for its status
+/// line: terminal-safe, and null when the result says nothing. A resume
+/// writes a saved call's line with it too, so the line reads as it did live.
+pub fn mcpFailureCause(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    if (safe_result.len == 0) return null;
     // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
     // The cause comes from that head, as it does in the trace.
     const model_text = result_store.storedPreview(safe_result) orelse safe_result;
@@ -1915,6 +1970,9 @@ pub fn finishCommittedFileStatus(
     status_started: bool,
     display_target: ?[]const u8,
     preview: diff.FileChangePreview,
+    /// The file the change wrote, resolved: `CommittedFileHandoff`'s
+    /// tracker path.
+    resolved_path: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
@@ -1939,8 +1997,31 @@ pub fn finishCommittedFileStatus(
                 .kind = .completed,
                 .summary = line,
             },
+            .resolved_path = resolved_path,
         },
     });
+}
+
+test "a committed file change tells the transcript the file core resolved" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{ .id = "edit", .name = "edit_file", .arguments_json = "{\"path\":\"./tsec/x.tse\"}" };
+    try finishCommittedFileStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{
+        .path = "./tsec/x.tse",
+        .lines = &.{},
+        .additions = 1,
+        .deletions = 2,
+        .truncated = false,
+    }, "/w/tsec/x.tse", &.{});
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", terminal.resolved_path.?);
+    // What Ctrl+O, ACP, and `fx ask` show of the call does not change.
+    try std.testing.expect(terminal.result == null);
+    try std.testing.expect(std.mem.startsWith(u8, terminal.outcome.summary, "started edit_file"));
 }
 
 fn renderedSubagentSummary(
@@ -2263,6 +2344,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = false,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     const inherited = presentationGroupForStep(first_transition.active_group_id, 7, 12);
@@ -2278,6 +2360,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = true,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     try std.testing.expectEqual(
@@ -2305,10 +2388,54 @@ test "visible prose after streamed tools closes the group for the next step" {
             .has_visible_text = true,
             .saw_tool_start = true,
             .saw_visible_text_after_tool_start = true,
+            .asked_question = false,
         },
     );
 
     try std.testing.expectEqual(current, transition.tool_group_id.?);
+    try std.testing.expect(transition.active_group_id == null);
+}
+
+test "a step that only asks a question closes the group for the calls after the answer" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const asked = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = false,
+            .has_visible_text = false,
+            .saw_tool_start = true,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expect(asked.active_group_id == null);
+
+    const after_answer = presentationGroupForStep(asked.active_group_id, 7, 13);
+    try std.testing.expectEqual(
+        types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 13 },
+        after_answer,
+    );
+}
+
+test "calls in the step that asks keep the open group, and the group closes after it" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const transition = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = true,
+            .has_visible_text = false,
+            .saw_tool_start = false,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expectEqual(open, transition.tool_group_id.?);
     try std.testing.expect(transition.active_group_id == null);
 }
 
@@ -2348,6 +2475,26 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
         .progress => |event| try std.testing.expectEqualStrings("● Matching\x1b[0m", event.text),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "a provisional row carries its call's arguments once all of them have arrived" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, "read_file");
+    const whole = "{\"path\":\"a.md\",\"start_line\":3}";
+
+    // While they stream in, the row has none.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", kind, eligibleActionLabel("read_file"), null, "{\"path\":\"a.md\",\"start_li");
+    // The provider's finished call has them all.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", kind, eligibleActionLabel("read_file"), "a.md", whole);
+
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expect(capture.events.items[0].provisional.arguments_json == null);
+    try std.testing.expectEqualStrings(whole, capture.events.items[2].provisional.arguments_json.?);
 }
 
 test "provisional toolbox labels read as what the call opens, runs, or searches" {

@@ -140,3 +140,16 @@ Platform and toolchain: macOS arm64, Zig 0.17.1, Python 3.
 | Built `./zig-out/bin/fx` smoke (`--version` and `config get max_subagents`) | Passed (`0.0.17`, `0`, clean stderr) |
 
 Outstanding for hosted CI: Linux x64/arm64 and macOS arm64 PR CI lanes, `publish-private-libfx.yml` `cli-macos` publish run, and Apple Developer ID signing and notarization once Apple secrets are configured.
+
+## Kai-runtime Fx v0.0.18 sync
+
+The merge at `b6e741bca5f6` imports 212 Kai commits through Fx `6196071`. The checks below ran on Linux x86_64 with Zig 0.17.1 and Bun 1.4.5.
+
+| Check | Result |
+| --- | --- |
+| `zig build` and CLI smoke | Passed. The binary reports `0.0.18`, `max_subagents` defaults to `0`, and `FX_PROJECT_CONFIG=0` disables project configuration. |
+| Zig formatting, CLI shape, and agents, compactor, indexer, and recovery boundaries | Passed |
+| PGSO corpus tests | 38 passed with 78 candidate scenarios, including Kai's project-configuration test. |
+| Focused ACP and project-configuration E2E | Seven passed using local fake providers. Covered live and replayed shell metadata, a command kept across prompts, subagent profile discovery, project-configuration policy, and content-filter refusal. |
+
+Hosted Linux and macOS verification is tracked in [PR #24](https://github.com/adeyemiadekunle/kai-runtime/pull/24).

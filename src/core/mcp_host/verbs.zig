@@ -7,6 +7,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_depth = @import("../shared/json_depth.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -66,9 +67,8 @@ pub const Command = union(enum) {
     list: struct { json: bool = false },
     show: struct { name: []const u8, json: bool = false },
     /// `login`: sign in to a new HTTP server that needs a login.
-    /// `old_profile`: the older `--profile` named the file, so fx warns.
-    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, login: bool = true, old_profile: bool = false },
-    remove: struct { name: []const u8, file: ?config_file.File, old_profile: bool = false },
+    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, login: bool = true },
+    remove: struct { name: []const u8, file: ?config_file.File },
     login: struct { name: []const u8, browser: bool },
     logout: []const u8,
     /// Null approves every project server.
@@ -122,7 +122,6 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     var json = false;
     var project = false;
     var profile = false;
-    var old_profile = false;
     var all = false;
     var no_browser = false;
     var no_login = false;
@@ -144,10 +143,8 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             .json => json = true,
             .project => project = true,
             .global => profile = true,
-            .profile => {
-                profile = true;
-                old_profile = true;
-            },
+            // The flag parser refuses a removed `--profile` before it gets here.
+            .profile => return usage(arena, verb, "{s} {s}: --profile was removed; use --global", .{ p, @tagName(verb) }),
             .all => all = true,
             .no_browser => no_browser = true,
             .no_login => no_login = true,
@@ -181,7 +178,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 const command = rest[dash + 1 ..];
                 if (command.len == 0) return usage(arena, verb, "{s} add needs a command after --.", .{p});
                 if (pair_flag == .header) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
-                return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } }, .old_profile = old_profile } } };
+                return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } } } } };
             }
             // fx knows Slack's address, as `add slack` did before.
             const url = if (n.len == 1 and std.mem.eql(u8, name, "slack")) slack.server_url else url: {
@@ -191,7 +188,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
-            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login, .old_profile = old_profile } } };
+            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login } } };
         },
         .call => {
             if (surface == .shell) return usage(arena, verb, "/mcp call runs only in a command that fx's shell tool runs: fx mcp call TOOL [JSON].", .{});
@@ -224,7 +221,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .show => .{ .show = .{ .name = name, .json = json } },
         .remove => blk: {
             if (project and profile) return usage(arena, verb, "Use --project or --global, not both.", .{});
-            break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null, .old_profile = old_profile } };
+            break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null } };
         },
         .login => .{ .login = .{ .name = name, .browser = !no_browser } },
         .logout => .{ .logout = name },
@@ -241,7 +238,7 @@ fn isHelp(a: []const u8) bool {
 const Flag = enum { json, connect, global, profile, project, env, header, no_browser, no_login, all };
 
 // Each verb's flags, from the lists `fx mcp --help` and shell completion
-// show. `--global` picks ~/.fx/mcp.json; the older `--profile` still works.
+// show. `--global` picks ~/.fx/mcp.json.
 const scope_options = builtin_commands.mcp_scope_options;
 const list_cli_options = builtin_commands.mcp_list_options;
 const list_shell_options = builtin_commands.mcp_list_shell_options;
@@ -347,9 +344,11 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  list prints every tool of SERVER and search the tools that best
             \\  match QUERY, one per line: the name, a tab, and the description.
             \\  help prints the arguments TOOL takes and what it does.
-            \\  Works only in a command that fx's shell tool runs, while it runs, and
-            \\  asks permission as a direct call of TOOL would; list, search, and
-            \\  help need none and show only the tools that agent may use.
+            \\  Works only in a command that fx's shell tool runs, while that shell
+            \\  call runs, so check a slow job with one short shell call per check,
+            \\  not one long loop. Asks permission as a direct call of TOOL would;
+            \\  list, search, and help need none and show only the tools that agent
+            \\  may use.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
             \\  3 outside a running fx shell call, 4 when too many calls are
             \\  running, 5 when permission is not granted, and 6 when the tool
@@ -484,12 +483,6 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
         .help, .call => {},
         else => if (!std.Io.Dir.path.isAbsolute(c.home)) return error.HomeNotSet,
     }
-    const old_profile = switch (command) {
-        .add => |a| a.old_profile,
-        .remove => |r| r.old_profile,
-        else => false,
-    };
-    if (old_profile) try c.err.print("{s} {s}: --profile " ++ command_specs.deprecated_until ++ "; use --global\n", .{ c.surface.prog(), @tagName(command) });
     return switch (command) {
         .help => |verb| {
             try writeUsage(c.out, c.surface, verb);
@@ -512,6 +505,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
 const not_plain_words = "isn't a plain file; replace it with one";
 const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
 const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+const too_deep_words = std.fmt.comptimePrint("is nested more than {d} levels deep; flatten it by hand first", .{json_depth.max_depth});
 
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
@@ -564,6 +558,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
+        error.TooDeep => "the file " ++ too_deep_words,
         error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
         error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
@@ -1367,9 +1362,12 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("1=2", stdio.entry.stdio.env[0].value);
 
     try testing.expectEqual(@as(?config_file.File, .project), (try parseCli(a, &.{ "remove", "--project", "x" })).command.remove.file);
-    // `--global` names the profile file; the older `--profile` still works.
+    // `--global` names the profile file. `--profile` is a removed spelling.
     try testing.expectEqual(@as(?config_file.File, .profile), (try parseCli(a, &.{ "remove", "--global", "x" })).command.remove.file);
-    try testing.expectEqual(@as(?config_file.File, .profile), (try parseCli(a, &.{ "remove", "--profile", "x" })).command.remove.file);
+    switch (try parseCli(a, &.{ "remove", "--profile", "x" })) {
+        .usage => |u| try testing.expect(std.mem.find(u8, u.message, "--profile was removed; use --global") != null),
+        else => return error.TestExpectedUsage,
+    }
     try testing.expectEqual(config_file.File.profile, (try parseCli(a, &.{ "add", "--global", "web", "https://w/mcp" })).command.add.file);
     try testing.expectEqual(@as(?config_file.File, null), (try parseCli(a, &.{ "remove", "x" })).command.remove.file);
     try testing.expect(!(try parseCli(a, &.{ "login", "--no-browser", "x" })).command.login.browser);
@@ -1438,7 +1436,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
         .{ .args = &.{ "add", "--env", "A=1", "web", "https://w" }, .message = "--env is for stdio servers; use --header for HTTP." },
         .{ .args = &.{ "add", "--header", "A=1", "web", "--", "node" }, .message = "--header is for HTTP servers; use --env for a command." },
         .{ .args = &.{ "add", "--env", "noequals", "web", "--", "node" }, .message = "--env needs KEY=VALUE." },
-        .{ .args = &.{ "remove", "--project", "--profile", "x" }, .message = "Use --project or --global, not both." },
+        .{ .args = &.{ "remove", "--project", "--global", "x" }, .message = "Use --project or --global, not both." },
         .{ .args = &.{ "add", "--global", "--project", "web", "https://w/mcp" }, .message = "Use --project or --global, not both." },
         .{ .args = &.{ "approve", "--all", "x" }, .message = "fx mcp approve takes a NAME or --all, not both." },
         .{ .args = &.{ "logout", "--json", "x" }, .message = "fx mcp logout: unknown flag --json" },
