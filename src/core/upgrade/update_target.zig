@@ -29,13 +29,18 @@ pub const CurrentBuild = struct {
     channel: Channel,
     version: []const u8,
     revision: []const u8,
+    /// The Kai runtime release this build was published as, such as
+    /// `0.0.18-kai.1`, or empty. Only the label shows it: update checks and
+    /// saved state keep using `version`.
+    release: []const u8 = "",
 
     pub fn writeVersionLabel(self: CurrentBuild, out: []u8) ![]const u8 {
-        if (self.channel != .dev) return std.mem.print(out, "{s}", .{self.version});
+        const shown = if (self.release.len > 0) self.release else self.version;
+        if (self.channel != .dev) return std.mem.print(out, "{s}", .{shown});
         if (displayRevision(self.revision)) |rev| {
-            return std.mem.print(out, "{s}-{s} (dev)", .{ self.version, rev });
+            return std.mem.print(out, "{s}-{s} (dev)", .{ shown, rev });
         }
-        return std.mem.print(out, "{s} (dev)", .{self.version});
+        return std.mem.print(out, "{s} (dev)", .{shown});
     }
 };
 
@@ -235,6 +240,19 @@ test "CurrentBuild.writeVersionLabel formats stable and dev labels" {
 
     var tiny: [4]u8 = undefined;
     try std.testing.expectError(error.NoSpaceLeft, stable.writeVersionLabel(&tiny));
+}
+
+test "CurrentBuild.writeVersionLabel shows a Kai runtime release in place of the version" {
+    var buf: [max_version_label_bytes]u8 = undefined;
+
+    const stable: CurrentBuild = .{ .channel = .stable, .version = "0.0.18", .revision = "4259a031d3ac", .release = "0.0.18-kai.1" };
+    try std.testing.expectEqualStrings("0.0.18-kai.1", try stable.writeVersionLabel(&buf));
+
+    const dev: CurrentBuild = .{ .channel = .dev, .version = "0.0.18", .revision = "4259a031d3ac", .release = "0.0.18-kai.1" };
+    try std.testing.expectEqualStrings("0.0.18-kai.1-4259a03 (dev)", try dev.writeVersionLabel(&buf));
+
+    const longest: CurrentBuild = .{ .channel = .dev, .version = "0.0.18", .revision = "4259a031d3ac", .release = "0.0.18-kai.123456789012345678" };
+    try std.testing.expectEqualStrings("0.0.18-kai.123456789012345678-4259a03 (dev)", try longest.writeVersionLabel(&buf));
 }
 
 test "channel parsing accepts only stable and dev" {

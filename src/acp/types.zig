@@ -311,10 +311,14 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try w.writeByte('}');
     try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
-    try writeJsonStr(build_options.app_version, w);
+    try writeJsonStr(agent_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]}");
 }
+
+/// The version `initialize` reports, as `fx --version` prints it: the Kai runtime release the binary was built as
+/// (`-Dkai-release`), or fx's own version.
+const agent_version = if (build_options.kai_release.len > 0) build_options.kai_release else build_options.app_version;
 
 pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
     try w.writeAll("{\"stopReason\":");
@@ -552,7 +556,7 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"loadSession\":true") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"name\":\"fx\"") != null);
     try std.testing.expectEqualStrings(
-        build_options.app_version,
+        agent_version,
         parsed.value.object.get("agentInfo").?.object.get("version").?.string,
     );
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"image\":true") != null);
