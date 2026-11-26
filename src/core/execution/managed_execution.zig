@@ -2251,7 +2251,7 @@ test "a kept command stops streaming to a context that detached, and still recor
             if (!std.mem.eql(u8, item.execution_id, "managed-detached-output")) continue;
             if (item.state == .completed) {
                 finished = true;
-                try std.testing.expect(std.mem.indexOf(u8, item.output_tail, "two") != null);
+                try std.testing.expect(std.mem.find(u8, item.output_tail, "two") != null);
             }
         }
         if (!finished) io_mod.sleep(10 * std.time.ns_per_ms);

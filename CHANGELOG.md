@@ -50,6 +50,8 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 
 ### Upstream sync
 
+- Updated the kept-command output test to use Zig 0.17’s supported search API.
+
 - Merged the remaining 212 commits from `adeyemiadekunle/kai` through Fx `v0.0.18` (`6196071`). Review the ACP and permission changes in the release notes below when updating consumers.
 
 ## 0.0.18
