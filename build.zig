@@ -49,10 +49,19 @@ pub fn build(b: *std.Build) void {
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
+    const kai_release = b.option(
+        []const u8,
+        "kai-release",
+        "Kai runtime release that fx --version reports, such as 0.0.18-kai.1",
+    ) orelse "";
+    if (!isKaiRelease(app_version, kai_release)) {
+        std.debug.panic("-Dkai-release must be empty or {s}-kai.<n>, not {s}", .{ app_version, kai_release });
+    }
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption([]const u8, "app_version", app_version);
+    build_options.addOption([]const u8, "kai_release", kai_release);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
     // Whether this is a libfx artifact, which leaves out what only the fx
@@ -388,6 +397,8 @@ fn addWasmArtifact(
     const wasm_options = b.addOptions();
     wasm_options.addOption([]const u8, "git_commit", git_commit);
     wasm_options.addOption([]const u8, "app_version", app_version);
+    // libfx reports its release through its package version, not fx --version.
+    wasm_options.addOption([]const u8, "kai_release", "");
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
@@ -435,6 +446,7 @@ fn addNapiArtifact(
     const napi_options = b.addOptions();
     napi_options.addOption([]const u8, "git_commit", git_commit);
     napi_options.addOption([]const u8, "app_version", app_version);
+    napi_options.addOption([]const u8, "kai_release", "");
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
@@ -563,6 +575,22 @@ fn sessionManagerModule(
     });
     module.addImport("build_options", options.createModule());
     return module;
+}
+
+/// Whether `release` is empty or names a Kai runtime release of `app_version`:
+/// `<app_version>-kai.<n>`, where `n` is a decimal number.
+fn isKaiRelease(app_version: []const u8, release: []const u8) bool {
+    if (release.len == 0) return true;
+    // `update_target.max_version_bytes`, the longest version fx --version prints.
+    if (release.len > 32) return false;
+    if (!std.mem.startsWith(u8, release, app_version)) return false;
+    const rest = release[app_version.len..];
+    const marker = "-kai.";
+    if (!std.mem.startsWith(u8, rest, marker)) return false;
+    const number = rest[marker.len..];
+    if (number.len == 0) return false;
+    for (number) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 fn readAppVersion(b: *std.Build) []const u8 {

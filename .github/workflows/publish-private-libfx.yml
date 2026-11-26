@@ -110,7 +110,7 @@ jobs:
         run: |
           mkdir -p fx-bins
           for arch in x86_64 aarch64; do
-            zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dupdate-channel=stable -Dtarget=${arch}-linux-musl
+            zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dupdate-channel=stable -Dkai-release=${{ needs.metadata.outputs.version }} -Dtarget=${arch}-linux-musl
             cp zig-out/bin/fx fx-bins/fx-${arch}
           done
           scripts/smoke-binary.sh fx-bins/fx-x86_64
@@ -141,7 +141,7 @@ jobs:
           version: "0.17.1"
       - name: Build fx for ${{ matrix.package_platform }}
         run: |
-          zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dupdate-channel=stable
+          zig build -Doptimize=ReleaseSafe -Dcpu=baseline -Dupdate-channel=stable -Dkai-release=${{ needs.metadata.outputs.version }}
           scripts/smoke-binary.sh zig-out/bin/fx
       - name: Sign and notarize fx when Apple credentials are configured
         env:

@@ -8,8 +8,9 @@
 #
 # <bin-dir> holds fx-x86_64 and fx-aarch64 (static Linux builds from this
 # commit: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
-# -Dtarget=<arch>-linux-musl) and may also hold fx-darwin-arm64 and
-# fx-darwin-x64 (macOS builds). The environment is as for
+# -Dkai-release=$LIBFX_VERSION -Dtarget=<arch>-linux-musl) and may also hold
+# fx-darwin-arm64 and fx-darwin-x64 (macOS builds, also with -Dkai-release).
+# Each must report $LIBFX_VERSION as its fx --version. The environment is as for
 # package-private-libfx.sh: LIBFX_VERSION, LIBFX_SCOPE, LIBFX_NAME,
 # LIBFX_REGISTRY and, to publish, NODE_AUTH_TOKEN.
 set -euo pipefail
@@ -104,7 +105,7 @@ done
 license=$(jq -r .license "$root/sdk/package.json")
 [ "$license" = "Apache-2.0" ] || { echo "update the license in this script: sdk/package.json says $license" >&2; exit 1; }
 
-# This machine's binary runs and reports the version it was built as.
+# This machine's binary runs and reports the Kai release it was built as (-Dkai-release).
 host_pkg=""
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64) host_pkg="$out/cli/$name-cli-linux-x64/bin/fx" ;;
@@ -114,7 +115,7 @@ case "$(uname -s):$(uname -m)" in
 esac
 if [ -n "$host_pkg" ] && [ -x "$host_pkg" ]; then
   reported=$("$host_pkg" --version)
-  [[ "$reported" == *"$base_version"* ]] || { echo "fx --version said $reported" >&2; exit 1; }
+  [ "$reported" = "$LIBFX_VERSION" ] || { echo "fx --version said $reported, not $LIBFX_VERSION: build it with -Dkai-release=$LIBFX_VERSION" >&2; exit 1; }
   echo "fx runs: $reported"
 fi
 cat "$out/cli/fx.sha256"

@@ -257,6 +257,8 @@ const version_usage = "usage: fx --version\n";
 
 pub const Config = struct {
     version: []const u8 = "",
+    /// The Kai runtime release `fx --version` reports (`update_target.CurrentBuild.release`).
+    release: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
@@ -1707,6 +1709,7 @@ fn runNonInteractiveWithDeps(
             .channel = cfg.build_channel,
             .version = cfg.version,
             .revision = cfg.revision,
+            .release = cfg.release,
         };
         const label = try build.writeVersionLabel(line_buf[0..update_target.max_version_label_bytes]);
         line_buf[label.len] = '\n';

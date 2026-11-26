@@ -4601,6 +4601,7 @@ test "native app preserves the built-in tool set without workspace metadata" {
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
+        .release = build_options.kai_release,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
@@ -4638,6 +4639,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
 fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
+        .release = build_options.kai_release,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
@@ -4675,6 +4677,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
 fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
+        .release = build_options.kai_release,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,

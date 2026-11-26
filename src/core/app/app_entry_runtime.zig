@@ -76,6 +76,8 @@ const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
 
 pub const Config = struct {
     version: []const u8 = "",
+    /// The Kai runtime release `fx --version` reports (`update_target.CurrentBuild.release`).
+    release: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
     auth_mode: credentials.AuthMode = .local,
@@ -512,6 +514,7 @@ fn writeUpgradeRelaunchFailure(
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
     return .{
         .version = cfg.version,
+        .release = cfg.release,
         .revision = cfg.revision,
         .build_channel = cfg.build_channel,
         .auth_mode = cfg.auth_mode,
