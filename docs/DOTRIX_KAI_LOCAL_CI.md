@@ -166,3 +166,18 @@ Published from `4259a031d` by `publish-private-libfx.yml` (run 45893155716). The
 | Dotrix `fx_host` on Windows | `npm ci` installed `0.0.18-kai.1`. `handoff.test.mjs` passed through the WebAssembly fallback (`--experimental-wasm-jspi`), since no Windows native addon is published. `platform-handoff-probe.mjs` aborts on a libuv assertion on Windows, and it does the same on `0.0.17-kai.3`. |
 
 Outstanding: the arm64 and macOS packages were not run outside GitHub's runners. Dotrix's cross-version journal test and its Linux fx coding tests run in Dotrix's CI.
+
+## Kai runtime 0.0.18-kai.2 release
+
+Published from `f3450193` by `publish-private-libfx.yml` (run 45910918125), after the `-Dkai-release` change (PR #26). The checks below ran on WSL Ubuntu x86_64 with Zig 0.17.1 and Node 18.19.1, and on Windows 11 x64 with Node 24.13.1.
+
+| Check | Result |
+| --- | --- |
+| `zig fmt --check src/ build.zig` and `check_deprecated.py` (PR #26) | Passed |
+| `-Dkai-release` validation (PR #26) | `0.0.17-kai.1` and `0.0.18-kai.x` stop the build. A plain build reports `0.0.18`, and `-Dkai-release=0.0.18-kai.2` reports it for `--version`, `-v`, and ACP `agentInfo.version`, with clean stderr. |
+| `zig build test` in Debug (PR #26) | 13109 of 13136 passed, 25 skipped, and 2 failed, neither in code the change touches: a git worktree test, since the copy had no `.git`, and a streamed-presentation span test. Hosted CI passed both in ReleaseSafe. |
+| Published packages | `@kunemi-group/kai@0.0.18-kai.2` records `gitHead` `f3450193`. Each Linux `bin/fx` matches its SHA-256 and `fx.sha256`. |
+| Published x64 `fx` | Reports `0.0.18-kai.2`, and `project_config` is `false`. Dotrix's native version check accepts it and refuses 0.0.18-kai.1. `fx-acp.mjs` ran a turn and a resumed turn, both `end_turn` with clean stderr. |
+| Dotrix `fx_host` on Windows | `npm ci` installed `0.0.18-kai.2`. `handoff.test.mjs` passed through the WebAssembly fallback. |
+
+Outstanding: the arm64 and macOS packages were not run outside GitHub's runners.
