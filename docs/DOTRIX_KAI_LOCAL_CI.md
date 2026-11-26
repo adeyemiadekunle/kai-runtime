@@ -153,3 +153,16 @@ The merge at `b6e741bca5f6` imports 212 Kai commits through Fx `6196071`. The ch
 | Focused ACP and project-configuration E2E | Seven passed using local fake providers. Covered live and replayed shell metadata, a command kept across prompts, subagent profile discovery, project-configuration policy, and content-filter refusal. |
 
 Hosted Linux and macOS verification is tracked in [PR #24](https://github.com/adeyemiadekunle/kai-runtime/pull/24).
+
+## Kai runtime 0.0.18-kai.1 release
+
+Published from `4259a031d` by `publish-private-libfx.yml` (run 45893155716). The checks below ran on Windows 11 x64 with Node 24.13.1, and on WSL Ubuntu x86_64 with Node 18.19.1.
+
+| Check | Result |
+| --- | --- |
+| Hosted CI on the release commit (PR #24) | Passed: Build & Test, E2E (deterministic), Shellcheck, Startup Latency, macOS arm64, and every SDK job. |
+| Published package metadata | `@kunemi-group/kai@0.0.18-kai.1` records `gitHead` `4259a031d`. Each Linux `bin/fx` matches its SHA-256 and the package's `fx.sha256`. |
+| Published x64 `fx` on WSL Ubuntu | Reports `0.0.18`, and `config get project_config` is `false` with `FX_PROJECT_CONFIG=0`. Dotrix's `fx-acp.mjs` ran a turn and a resumed turn against a scripted model, both `end_turn` with clean stderr. |
+| Dotrix `fx_host` on Windows | `npm ci` installed `0.0.18-kai.1`. `handoff.test.mjs` passed through the WebAssembly fallback (`--experimental-wasm-jspi`), since no Windows native addon is published. `platform-handoff-probe.mjs` aborts on a libuv assertion on Windows, and it does the same on `0.0.17-kai.3`. |
+
+Outstanding: the arm64 and macOS packages were not run outside GitHub's runners. Dotrix's cross-version journal test and its Linux fx coding tests run in Dotrix's CI.
