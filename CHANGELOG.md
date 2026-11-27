@@ -35,6 +35,7 @@ Changes on the Kai runtime fork (adeyemiadekunle/kai-runtime) since the fx 0.0.1
 - The fx command is packaged by `scripts/package-private-cli.sh` and `publish-private-libfx.yml` for Linux (`@kunemi-group/kai-cli-linux-x64`, `@kunemi-group/kai-cli-linux-arm64`) and macOS (`@kunemi-group/kai-cli-darwin-arm64`, `@kunemi-group/kai-cli-darwin-x64`), updated to Zig 0.17.1. `scripts/sign-and-notarize-macos.sh` reads optional `APPLE_SIGNING_IDENTITY`, `APPLE_SIGNING_IDENTIFIER`, and `APPLE_SIGNING_TEAM_ID` overrides (and `publish-private-libfx.yml` falls back to ad-hoc `codesign` when Developer ID / notary secrets are absent).
 - Each published version is tagged `v<version>` with a GitHub release by the manual workflow `kai-release.yml`, from `docs/releases/v<version>.md`; `v0.0.17-kai.1` is the first.
 - `0.0.18-kai.1`, the first release on fx 0.0.18, is published from commit `4259a031`, with its notes in `docs/releases/v0.0.18-kai.1.md`. Dotrix moves Chat and Codes to it.
+- `0.0.18-kai.2` is published from commit `f3450193`, with its notes in `docs/releases/v0.0.18-kai.2.md`. It is the first release whose `fx --version` reports its whole release, and Dotrix pins Chat and Codes to it.
 - The upstream publishing workflows (release, dev release, libfx to npm, CDN backfill) run only in `vercel-labs/fx`, so the fork never publishes under fx's names.
 
 ### Tests and docs
